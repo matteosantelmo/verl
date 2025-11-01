@@ -423,7 +423,7 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, log_probs=None, entropies=None):
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, log_probs=None, entropies=None, data_sources=None, extra_infos=None):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -436,6 +436,14 @@ class RayPPOTrainer:
             "score": scores,
             "step": [self.global_steps] * n,
         }
+        
+        # Add data_source if provided
+        if data_sources is not None and len(data_sources) == n:
+            base_data["data_source"] = data_sources
+        
+        # Add extra_info if provided
+        if extra_infos is not None and len(extra_infos) == n:
+            base_data["extra_info"] = extra_infos
         
         # Add log probabilities if provided
         if log_probs is not None and len(log_probs) == n:
@@ -458,6 +466,89 @@ class RayPPOTrainer:
             f.write("\n".join(lines) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _dump_token_level_data(
+        self,
+        inputs,
+        outputs,
+        response_ids,
+        token_entropies,
+        token_log_probs,
+        response_masks,
+        scores,
+        dump_path,
+        gts=None,
+        data_sources=None,
+        extra_infos=None,
+    ):
+        """Dump token-level entropy and log probability data as a pickle file.
+
+        Args:
+            inputs: List of input strings
+            outputs: List of output strings
+            response_ids: Tensor of response token IDs (batch_size, max_response_length)
+            token_entropies: Tensor of per-token entropies (batch_size, max_response_length)
+            token_log_probs: Tensor of per-token log probabilities (batch_size, max_response_length)
+            response_masks: Tensor of response masks (batch_size, max_response_length)
+            scores: List of reward scores
+            dump_path: Directory to save the file
+            gts: Optional list of ground-truth strings (aligned with inputs)
+            data_sources: Optional list of data_source strings (aligned with inputs)
+            extra_infos: Optional list of dicts with extra_info (aligned with inputs)
+        """
+        import pickle
+        
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}_token_level.pkl")
+        
+        # Convert tensors to numpy for better serialization
+        response_ids_np = response_ids.cpu().numpy()
+        token_entropies_np = token_entropies.cpu().numpy()
+        token_log_probs_np = token_log_probs.cpu().numpy()
+        response_masks_np = response_masks.cpu().numpy()
+        
+        n = len(inputs)
+        # Prepare aligned optional metadata with sensible defaults
+        has_gts = gts is not None and len(gts) == n
+        has_data_sources = data_sources is not None and len(data_sources) == n
+        has_extra_infos = extra_infos is not None and len(extra_infos) == n
+
+        token_level_data = []
+        for i in range(n):
+            # Get the actual length of the response (number of valid tokens)
+            mask = response_masks_np[i]
+            valid_length = int(mask.sum())
+            
+            # Extract valid tokens and their properties
+            valid_token_ids = response_ids_np[i, :valid_length].tolist()
+            valid_entropies = token_entropies_np[i, :valid_length].tolist()
+            valid_log_probs = token_log_probs_np[i, :valid_length].tolist()
+            
+            # Decode individual tokens for inspection
+            tokens = [self.tokenizer.decode([tid]) for tid in valid_token_ids]
+            
+            entry = {
+                "data_source": data_sources[i] if has_data_sources else "unknown",
+                "input": inputs[i],
+                "output": outputs[i],
+                "score": scores[i],
+                "step": self.global_steps,
+                "token_ids": valid_token_ids,
+                "tokens": tokens,
+                "gts": gts[i] if has_gts else None,
+                "entropies": valid_entropies,
+                "log_probs": valid_log_probs,
+                "num_tokens": valid_length,
+                "extra_info": extra_infos[i] if has_extra_infos else None,
+            }
+
+            token_level_data.append(entry)
+        
+        # Save as pickle file
+        with open(filename, "wb") as f:
+            pickle.dump(token_level_data, f)
+        
+        print(f"Dumped token-level data to {filename} ({len(token_level_data)} samples)")
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -559,6 +650,14 @@ class RayPPOTrainer:
         sample_uids = []
         sample_log_probs = []
         sample_entropies = []
+        sample_data_sources = []
+        sample_extra_infos = []
+        
+        # Lists to collect token-level data
+        all_response_ids = []
+        all_token_entropies = []
+        all_token_log_probs = []
+        all_response_masks = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -588,6 +687,16 @@ class RayPPOTrainer:
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
             ]
             sample_gts.extend(ground_truths)
+
+            data_sources = [
+                item.non_tensor_batch.get("data_source", "unknown") for item in test_batch
+            ]
+            sample_data_sources.extend(data_sources)
+            
+            extra_infos = [
+                item.non_tensor_batch.get("extra_info", {}) for item in test_batch
+            ]
+            sample_extra_infos.extend(extra_infos)
 
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
@@ -643,6 +752,12 @@ class RayPPOTrainer:
 
             val_entropies_mean = masked_mean(val_entropies, response_mask, axis=-1).cpu().tolist()
             sample_entropies.extend(val_entropies_mean)
+            
+            # Collect token-level data
+            all_response_ids.append(test_output_gen_batch.batch["responses"])
+            all_token_entropies.append(val_entropies)
+            all_token_log_probs.append(val_log_probs)
+            all_response_masks.append(response_mask)
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
@@ -675,9 +790,33 @@ class RayPPOTrainer:
                 scores=sample_scores,
                 log_probs=sample_log_probs,
                 entropies=sample_entropies,
+                data_sources=sample_data_sources,
+                extra_infos=sample_extra_infos,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
             )
+            
+            # Dump token-level data
+            if len(all_response_ids) > 0:
+                # Concatenate all batches
+                response_ids_concat = torch.cat(all_response_ids, dim=0)
+                token_entropies_concat = torch.cat(all_token_entropies, dim=0)
+                token_log_probs_concat = torch.cat(all_token_log_probs, dim=0)
+                response_masks_concat = torch.cat(all_response_masks, dim=0)
+                
+                self._dump_token_level_data(
+                    inputs=sample_inputs,
+                    outputs=sample_outputs,
+                    response_ids=response_ids_concat,
+                    token_entropies=token_entropies_concat,
+                    token_log_probs=token_log_probs_concat,
+                    response_masks=response_masks_concat,
+                    scores=sample_scores,
+                    dump_path=val_data_dir,
+                    gts=sample_gts,
+                    data_sources=sample_data_sources,
+                    extra_infos=sample_extra_infos,
+                )
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
