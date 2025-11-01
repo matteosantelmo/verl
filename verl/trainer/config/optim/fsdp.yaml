@@ -35,8 +35,11 @@ min_lr_ratio: 0.0
 # Number of cosine cycles in LR schedule
 num_cycles: 0.5
 
-# LR warmup style: "constant" or "cosine"
-warmup_style: constant
+# LR scheduler type: "constant" or "cosine"
+lr_scheduler_type: constant
+
+# deprecated
+warmup_style: null
 
 # Additional optimizer-specific keyword arguments
 # Example for torchao with bf16 stochastic rounding:
@@ -45,4 +48,3 @@ warmup_style: constant
 # override_optimizer_config:
 #   bf16_stochastic_round: true
 override_optimizer_config: null
-

@@ -78,7 +78,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.compute_entropy_from_logits = (
             torch.compile(entropy_from_logits, dynamic=True)
-            if self.config.get("use_torch_compile", True)  #  use torch compile by default
+            if self.config.get("use_torch_compile", True)  # use torch compile by default
             else entropy_from_logits
         )
         self.device_name = get_device_name()
@@ -373,13 +373,12 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-        if self.config.tis_imp_ratio_cap > 0:
-            assert "rollout_log_probs" in data.batch.keys(), (
-                "Truncated Importance Sampling (TIS) requires to configure "
-                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
-                "and is not currently supported in Server mode (agent loop)."
-            )
-            select_keys.append("rollout_log_probs")
+        # Include pre-computed IS weights if present in batch
+        # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
+        if "rollout_is_weights" in data.batch.keys():
+            select_keys.append("rollout_is_weights")
+        if "rollout_is_self_norm_flag" in data.batch.keys():
+            select_keys.append("rollout_is_self_norm_flag")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -406,13 +405,50 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
+                global_snis_denom = None
+                try:
+                    if (
+                        "rollout_is_weights" in mini_batch.batch.keys()
+                        and "rollout_is_self_norm_flag" in mini_batch.batch.keys()
+                    ):
+                        # Compute a global SNIS denominator
+                        with torch.no_grad():
+                            weights_full = mini_batch.batch["rollout_is_weights"]
+                            response_mask_full = mini_batch.batch["response_mask"]
+                            mask_float = response_mask_full.to(dtype=weights_full.dtype)
+
+                            loss_mode_batch = self.config.policy_loss.get("loss_mode", "vanilla")
+                            loss_agg_mode_batch = self.config.loss_agg_mode
+
+                            if loss_mode_batch == "geo_mean":
+                                global_snis_denom = None
+                            else:
+                                lam = "seq-mean-token-mean" if loss_mode_batch == "gspo" else loss_agg_mode_batch
+                                if lam == "token-mean":
+                                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                                        global_snis_denom = verl_F.distributed_masked_mean(weights_full, mask_float)
+                                    else:
+                                        global_snis_denom = verl_F.masked_mean(weights_full, mask_float)
+                                elif lam == "seq-mean-token-sum":
+                                    global_snis_denom = None
+                                elif lam == "seq-mean-token-mean":
+                                    global_snis_denom = None
+                                elif lam == "seq-mean-token-sum-norm":
+                                    denom_sum = (weights_full * mask_float).sum()
+                                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                                        torch.distributed.all_reduce(denom_sum, op=torch.distributed.ReduceOp.SUM)
+                                    global_snis_denom = denom_sum / weights_full.shape[-1]
+                                else:
+                                    raise ValueError(f"loss_agg_mode: {lam} not supported for SNIS")
+                except Exception:
+                    global_snis_denom = None
+
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
-                    rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
                     advantages = model_inputs["advantages"]
 
                     entropy_coeff = self.config.entropy_coeff
@@ -431,16 +467,79 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
-                    if on_policy:
-                        old_log_prob = log_prob.detach()
-                    else:
+                    # for fully_async_policy recipe
+                    if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
+                    else:
+                        if on_policy:
+                            old_log_prob = log_prob.detach()
+                        else:
+                            old_log_prob = model_inputs["old_log_probs"]
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+
+                    # Extract pre-computed rollout importance sampling weights if present
+                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
+                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+
+                    if (
+                        rollout_is_weights is not None
+                        and model_inputs.get("rollout_is_self_norm_flag", None) is not None
+                    ):
+                        # Determine effective aggregation mode for this micro-batch
+                        loss_mode_mb = self.config.policy_loss.get("loss_mode", "vanilla")
+                        lam = "seq-mean-token-mean" if loss_mode_mb == "gspo" else self.config.loss_agg_mode
+
+                        mask_float_mb = response_mask.to(dtype=rollout_is_weights.dtype)
+
+                        if loss_mode_mb == "geo_mean":
+                            # Per-sequence geometric mean (vector).
+                            with torch.no_grad():
+                                den_vec = (
+                                    torch.exp(
+                                        verl_F.masked_mean(
+                                            torch.log(rollout_is_weights.clamp_min(1e-10)),
+                                            mask_float_mb,
+                                            axis=-1,
+                                        )
+                                    )
+                                    .unsqueeze(-1)
+                                    .clamp_min(1e-8)
+                                )
+                            rollout_is_weights /= den_vec
+                        elif lam == "seq-mean-token-mean":
+                            # Per-sequence masked mean denominator (vector)
+                            with torch.no_grad():
+                                den_vec = (
+                                    verl_F.masked_mean(rollout_is_weights, mask_float_mb, axis=-1)
+                                    .unsqueeze(-1)
+                                    .clamp_min(1e-8)
+                                )
+                            rollout_is_weights /= den_vec
+                        elif lam == "seq-mean-token-sum":
+                            # Per-sequence masked sum denominator (vector)
+                            with torch.no_grad():
+                                den_vec = (
+                                    verl_F.masked_sum(rollout_is_weights, mask_float_mb, axis=-1)
+                                    .unsqueeze(-1)
+                                    .clamp_min(1e-8)
+                                )
+                            rollout_is_weights /= den_vec
+                        elif lam in ("token-mean", "seq-mean-token-sum-norm") and global_snis_denom is not None:
+                            # Global/batch scalar denominator
+                            rollout_is_weights /= global_snis_denom.clamp_min(1e-8)
+
+                    # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
+                    # are computed centrally in ray_trainer.py for consistency and efficiency.
+                    # This ensures metrics are computed uniformly across all batches at the trainer level
+                    # and avoids redundant computation across workers and micro-batches.
+
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                    # Compute policy loss (all functions return 4 values)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -448,7 +547,7 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask=response_mask,
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
-                        rollout_log_probs=rollout_log_probs,
+                        rollout_is_weights=rollout_is_weights,
                     )
 
                     if entropy_coeff != 0:
