@@ -37,6 +37,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--local_save_dir", default="~/data/math_500", help="The save directory for the preprocessed dataset."
     )
+    parser.add_argument("--gsm8k_format", action="store_true", help="Whether to use GSM8K format.", default=False)
 
     args = parser.parse_args()
     local_dataset_path = args.local_dataset_path
@@ -57,7 +58,10 @@ if __name__ == "__main__":
     # NOTE: only test set is available
     test_dataset = dataset["test"]
 
-    instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
+    if args.gsm8k_format:
+        instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+    else:
+        instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
@@ -69,7 +73,7 @@ if __name__ == "__main__":
             answer = example.pop("solution")
             solution = extract_solution(answer)
             data = {
-                "data_source": data_source,
+                "data_source": data_source + ("_gsm8k_format" if args.gsm8k_format else ""),
                 "prompt": [{"role": "user", "content": question}],
                 "ability": "math",
                 "reward_model": {"style": "rule", "ground_truth": solution},
