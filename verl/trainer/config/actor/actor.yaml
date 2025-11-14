@@ -47,7 +47,7 @@ policy_loss:
   # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.PolicyLossConfig
 
-  # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617
+  # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617 / entropy_control from https://arxiv.org/abs/2510.10150
   loss_mode: "vanilla"
 
   # Ratio of tokens to be clipped for clip-cov loss
@@ -64,6 +64,15 @@ policy_loss:
 
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
+
+  # Whether to use linear mapping for token weights (entropy_control mode)
+  linear: true
+
+  # Minimum token weight value (entropy_control mode)
+  token_weight_min: 0.8
+
+  # Maximum token weight value (entropy_control mode)
+  token_weight_max: 1.2
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

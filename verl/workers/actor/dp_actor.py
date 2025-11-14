@@ -460,12 +460,16 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_scale_factor = 1 / self.gradient_accumulation
 
                     # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
-                    )
+                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                    if loss_mode == "entropy_control":
+                        entropy, log_prob = self._forward_micro_batch(micro_batch=model_inputs, temperature=temperature, calculate_entropy=True)
+                    else:
+                        calculate_entropy = False
+                        if entropy_coeff != 0:
+                            calculate_entropy = True
+                        entropy, log_prob = self._forward_micro_batch(
+                            model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                        )
 
                     # for fully_async_policy recipe
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -476,7 +480,6 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
                     # Extract pre-computed rollout importance sampling weights if present
@@ -540,15 +543,27 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (all functions return 4 values)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                    if loss_mode == "entropy_control":
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                            entropys=entropy,   # include entropys
+                        )
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
 
                     if entropy_coeff != 0:
                         entropy_loss = verl_F.masked_mean(entropy, response_mask)

@@ -1329,6 +1329,207 @@ def compute_policy_loss_geo_mean(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def compute_token_weights(
+    advantages: torch.Tensor,
+    entropys: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    token_weight_min: float = 0.8,
+    token_weight_max: float = 1.2,
+    linear: bool = True,
+) -> torch.Tensor:
+    """
+    
+    Args:
+        advantages (torch.Tensor): advantage values, shape (batch_size, response_length)
+        entropys (torch.Tensor): entropy values, shape (batch_size, response_length)
+        old_log_prob (torch.Tensor): old policy log probabilities, shape (batch_size, response_length)
+        log_prob (torch.Tensor): new policy log probabilities, shape (batch_size, response_length)
+        response_mask (torch.Tensor): response mask, shape (batch_size, response_length)
+        token_weight_min (float): minimum value for token weights, default 0.8
+        token_weight_max (float): maximum value for token weights, default 1.2
+        linear (bool): whether to use linear mapping strategy, default True
+            - True: use linear mapping to [token_weight_min, token_weight_max]
+            - False: use exponential mapping token_weights = exp(-k * metric)
+        
+    Returns:
+        torch.Tensor: computed token weights, shape (batch_size, response_length)
+                     all valid tokens have weights in [token_weight_min, token_weight_max] range
+    """
+
+    with torch.no_grad():
+
+        
+        # Calculate \delta
+        x = torch.exp(log_prob)  # Convert log_prob to probability values
+        x = torch.clamp(x, min=1e-8, max=1.0 - 1e-8)
+
+        x_one_minus_x_squared = x  * (1 - x) ** 2
+        ln_x_plus_h = torch.log(x) + entropys
+        
+        f_x = x_one_minus_x_squared * ln_x_plus_h
+        
+        # Calculate A / old_log_prob
+        old_prob = torch.exp(old_log_prob)
+        old_prob = torch.clamp(old_prob, min=1e-8, max=1.0)
+
+        advantage_over_old_prob = advantages / old_prob
+        
+        # Calculate \Omega
+        metric = advantage_over_old_prob * f_x
+        
+        if not torch.isfinite(metric).all():
+            print(f"[Token Weighting] Warning: Found non-finite values in metric")
+            metric = torch.where(torch.isfinite(metric), metric, torch.zeros_like(metric))
+        
+        # Calculate abs(\Omega)
+        metric = torch.abs(metric)
+        
+        valid_metric = metric[response_mask.bool()]
+        if valid_metric.numel() == 0:
+            return torch.zeros_like(response_mask, dtype=torch.float)
+            
+        metric_min = valid_metric.min()
+        metric_max = valid_metric.max()
+        
+        # Initialize token weights
+        token_weights = torch.zeros_like(metric, dtype=torch.float)
+        
+        # Calculate weights only for valid tokens
+        valid_mask = response_mask.bool()
+        if valid_mask.any():
+            valid_metric = metric[valid_mask]
+            
+            if linear:
+                # Linear mapping strategy: map to [token_weight_min, token_weight_max]
+                if metric_max > metric_min:
+                    scale_factor = (token_weight_max - token_weight_min) / (metric_max - metric_min)
+                    valid_weights = token_weight_max - (valid_metric - metric_min) * scale_factor
+                else:
+                    valid_weights = torch.full_like(valid_metric, (token_weight_min + token_weight_max) / 2)
+                valid_weights = torch.clamp(valid_weights, min=token_weight_min, max=token_weight_max)
+            else:
+                # Exponential mapping strategy: token_weights = exp(-k * metric)
+                k = -torch.log(torch.tensor(token_weight_min, dtype=metric.dtype, device=metric.device)) / \
+                    torch.maximum(
+                        metric_max,
+                        torch.tensor(0.02, dtype=metric.dtype, device=metric.device)
+                    )
+                valid_weights = torch.exp(-k * valid_metric)
+                valid_weights = torch.clamp(valid_weights, min=token_weight_min, max=1.0)
+            
+            # Apply computed weights to valid token positions
+            token_weights[valid_mask] = valid_weights
+        
+        token_weights = token_weights * response_mask.float()
+        
+        
+        return token_weights
+
+@register_policy_loss("entropy_control")
+def compute_policy_loss_with_entropy(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    entropys: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+):
+    """
+    Implementation of Stabilizing Token-level Entropy-changE via Reweighting (STEER), following the function compute_policy_loss.
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask for response tokens, shape (batch_size, response_length).
+        entropys (torch.Tensor):
+            Entropy values, shape (batch_size, response_length).
+        cliprange (float, optional):
+            Clipping range for policy loss. Defaults to None.
+        cliprange_low (float, optional):
+            Lower clipping range for policy loss. Defaults to None.
+        cliprange_high (float, optional):
+            Upper clipping range for policy loss. Defaults to None.
+        clip_ratio_c (float, optional):
+            Clipping ratio constant. Defaults to 3.0.
+        loss_agg_mode (str, optional):
+            Loss aggregation mode. Defaults to "token-mean".
+        token_weight_min (float, optional):
+            Token weight minimum value. Defaults to 0.8.
+        token_weight_max (float, optional):
+            Token weight maximum value. Defaults to 1.2.
+        linear (bool, optional):
+            Whether to use linear mapping strategy for token weights. Defaults to True.
+            - True: Use linear mapping to [token_weight_min, token_weight_max]
+            - False: Use exponential mapping token_weights = exp(-k * metric)
+    """
+    cliprange = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+    cliprange_low = config.clip_ratio_low if config.clip_ratio_low is not None else cliprange
+    cliprange_high = config.clip_ratio_high if config.clip_ratio_high is not None else cliprange
+    clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+        "clip_ratio_c", 3.0
+    )
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+
+
+    # Arguments for token weight computation
+    token_weight_min: float = config.policy_loss.get("token_weight_min", 0.8)
+    token_weight_max: float = config.policy_loss.get("token_weight_max", 1.2)
+    linear: bool = config.policy_loss.get("linear", True)
+
+    # Compute token weights
+    token_weights = compute_token_weights(
+        advantages=advantages,
+        entropys=entropys,
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        response_mask=response_mask,
+        token_weight_min=token_weight_min,
+        token_weight_max=token_weight_max,
+        linear=linear,  # whether linear mode is used
+    )
+    
+    assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
+
+    negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl) # exp(logπ_\theta - logπ_old)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    pg_losses1 = -advantages * ratio
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    
+    # Apply token weights to each token's loss
+    weighted_pg_losses = pg_losses * token_weights
+    
+    pg_loss = agg_loss(loss_mat=weighted_pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
 def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):
     """Compute categorical entropy loss (For backward compatibility)
 
