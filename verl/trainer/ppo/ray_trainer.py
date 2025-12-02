@@ -56,6 +56,12 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.trainer.ppo.entropy_aware_sampling import (
+    entropy_aware_subsample,
+    should_apply_entropy_aware_sampling,
+    get_entropy_aware_sampling_config,
+    get_entropy_stats
+)
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -1240,8 +1246,18 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+
+                # If entropy-aware sampling is enabled, over-sample by over_sampling_ratio
+                use_entropy_aware_sampling = should_apply_entropy_aware_sampling(self.config.algorithm)
+                base_n = self.config.actor_rollout_ref.rollout.n
+                if use_entropy_aware_sampling:
+                    _, over_sampling_ratio = get_entropy_aware_sampling_config(self.config.algorithm)
+                    rollout_n = int(base_n * over_sampling_ratio)
+                else:
+                    rollout_n = base_n
+
                 gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    repeat_times=rollout_n, interleave=True
                 )
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -1285,7 +1301,7 @@ class RayPPOTrainer:
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    batch = batch.repeat(repeat_times=rollout_n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1323,7 +1339,6 @@ class RayPPOTrainer:
                         entropy_agg = masked_mean(entropys, response_masks)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
@@ -1354,9 +1369,37 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        metrics.update(
+                            get_entropy_stats(batch, prefix="diversity_stats")
+                        )
+
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                        # Apply entropy-aware subsampling if enabled
+                        # This subsamples the batch to achieve calibrated uncertainty
+                        if use_entropy_aware_sampling:
+                            with marked_timer("entropy_aware_subsample", timing_raw, color="magenta"):
+                                selection_criterion, _ = get_entropy_aware_sampling_config(
+                                    self.config.algorithm
+                                )
+                                batch, ea_metrics = entropy_aware_subsample(
+                                    batch=batch,
+                                    target_n=base_n,
+                                    selection_criterion=selection_criterion,
+                                )
+                                metrics.update(ea_metrics)
+                                # Update reward_extra_infos_dict to match subsampled batch
+                                # The non_tensor_batch is already updated by entropy_aware_subsample
+                                reward_extra_infos_dict = {
+                                    k: batch.non_tensor_batch[k].tolist()
+                                    for k in reward_extra_infos_dict.keys()
+                                    if k in batch.non_tensor_batch
+                                }
+
+                        # Clean up entropys if it was kept for entropy-aware sampling
+                        if "entropys" in batch.batch:
+                            batch.batch.pop("entropys")
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
@@ -1383,7 +1426,7 @@ class RayPPOTrainer:
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            num_repeat=base_n,  # Use base_n (after subsampling if entropy-aware sampling is enabled)
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )

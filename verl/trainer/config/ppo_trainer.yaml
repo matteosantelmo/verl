@@ -138,6 +138,19 @@ algorithm:
   # Whether to apply self-normalized IS
   rollout_is_self_norm: false
 
+  # Entropy-aware sampling configuration for calibrated uncertainty
+  # When enabled, over-samples rollouts and then subsamples to achieve calibrated confidence
+  entropy_aware_sampling:
+
+    # How to select incorrect rollouts: null (disabled), "entropy", or "log_prob"
+    # "entropy": select incorrect answers with highest entropy (most uncertain)
+    # "log_prob": select incorrect answers with lowest log probability (least confident)
+    incorrect_rollouts_selection: null
+
+    # Over-sampling ratio: generate this many times more rollouts than target
+    # E.g., if n=8 and over_sampling_ratio=2.0, generate 16 rollouts per prompt
+    over_sampling_ratio: 2.0
+
 # config for the trainer
 trainer:
 
