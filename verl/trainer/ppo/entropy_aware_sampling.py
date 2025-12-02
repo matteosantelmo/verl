@@ -1,34 +1,3 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-Entropy-aware sampling module for calibrated uncertainty in RL training.
-
-This module implements a sampling strategy that aims to achieve calibrated uncertainty
-by subsampling rollouts based on entropy or log probability. The goal is to have the
-final fine-tuned model exhibit high entropy (low confidence) on prompts where it achieves
-low accuracy, and low entropy (high confidence) on prompts with high accuracy.
-
-The sampling mechanism works as follows:
-1. Over-sample m rollouts per prompt (m = over_sampling_ratio * n)
-2. Compute the proportion p of correct answers (reward=1) in the m samples
-3. Subsample n rollouts: p*n correct (randomly) and (1-p)*n incorrect
-4. For incorrect samples:
-   - If criterion="entropy": select those with highest entropy (most uncertain)
-   - If criterion="log_prob": select those with lowest log probability (least confident)
-   Both approaches aim to push the model toward being uncertain on incorrect answers.
-"""
-
 from collections import defaultdict
 from typing import Optional
 
@@ -136,7 +105,6 @@ def entropy_aware_subsample(
     selected_indices = []
     metrics = {
         "entropy_aware_sampling/groups_total": 0,
-        "entropy_aware_sampling/groups_with_sampling": 0,
         "entropy_aware_sampling/avg_correct_proportion": 0.0,
         "entropy_aware_sampling/avg_rollouts_per_group": 0.0,
         "entropy_aware_sampling/groups_all_correct": 0,
@@ -166,29 +134,11 @@ def entropy_aware_subsample(
         p = n_correct / group_size  # Proportion of correct answers
         total_correct_proportion += p
 
+        # Track edge cases for metrics
         if n_correct == 0:
-            # All incorrect: select target_n based on criterion
             metrics["entropy_aware_sampling/groups_all_incorrect"] += 1
-            if selection_criterion == "entropy":
-                # Higher entropy = more uncertain = select these
-                sorted_local = sorted(incorrect_local_indices, key=lambda i: group_criterion[i].item(), reverse=True)
-            else:  # log_prob
-                # Lower log prob = less confident wrong answers = select these (for calibration)
-                sorted_local = sorted(incorrect_local_indices, key=lambda i: group_criterion[i].item(), reverse=False)
-            selected_local = sorted_local[:target_n]
-            selected_indices.extend([indices[i] for i in selected_local])
-            continue
-
-        if n_incorrect == 0:
-            # All correct: randomly select target_n
+        elif n_incorrect == 0:
             metrics["entropy_aware_sampling/groups_all_correct"] += 1
-            np.random.shuffle(correct_local_indices)
-            selected_local = correct_local_indices[:target_n]
-            selected_indices.extend([indices[i] for i in selected_local])
-            continue
-
-        # Apply entropy-aware sampling
-        metrics["entropy_aware_sampling/groups_with_sampling"] += 1
 
         # Number of correct and incorrect to select
         n_correct_to_select = int(round(p * target_n))
@@ -215,14 +165,14 @@ def entropy_aware_subsample(
 
         # Select incorrect samples based on criterion
         if selection_criterion == "entropy":
-            # Select highest entropy (most uncertain)
-            sorted_incorrect = sorted(
-                incorrect_local_indices, key=lambda i: group_criterion[i].item(), reverse=True
-            )
-        else:  # log_prob
-            # Select lowest log prob (least confident wrong answers) for calibration
+            # Select lowest entropy (most confident wrong answers)
             sorted_incorrect = sorted(
                 incorrect_local_indices, key=lambda i: group_criterion[i].item(), reverse=False
+            )
+        else:  # log_prob
+            # Select highest log prob (most confident wrong answers)
+            sorted_incorrect = sorted(
+                incorrect_local_indices, key=lambda i: group_criterion[i].item(), reverse=True
             )
         selected_incorrect = sorted_incorrect[:n_incorrect_to_select]
 
