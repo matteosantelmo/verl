@@ -55,6 +55,26 @@ forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
 # the reward manager can be set to prime for parallel verification.
 reward_manager: naive
 
+# Diversity Bonus Configuration
+# Adds a diversity bonus to rewards to encourage diverse outputs for the same prompt.
+# Diversity is measured separately for correct and incorrect response groups.
+diversity_bonus:
+  # Whether to enable diversity bonus
+  enable: False
+  
+  # Name of the diversity metric to use (registered in verl.utils.diversity_bonus)
+  # Custom metrics can be registered using @register_diversity_metric decorator
+  metric: null
+  
+  # Scaling factor for diversity bonus on correct responses (reward > threshold)
+  lambda_pos: 0.0
+  
+  # Scaling factor for diversity bonus on incorrect responses (reward <= threshold)
+  lambda_neg: 0.0
+  
+  # Threshold to determine correct vs incorrect responses (exclusive for correct)
+  reward_threshold: 0.0
+
 # Whether to launch custom reward function asynchronously during log_prob
 # custom reward function executed async on CPU, during log_prob
 launch_reward_fn_async: False

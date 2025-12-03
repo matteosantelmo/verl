@@ -156,6 +156,17 @@ def load_reward_manager(
         else:
             final_compute_score = default_compute_score
 
+    # Extract diversity bonus configuration
+    diversity_bonus_config = config.reward_model.get("diversity_bonus", {})
+    if diversity_bonus_config.get("enable", False):
+        metric_name = diversity_bonus_config.get("metric")
+        if metric_name:
+            from verl.utils.diversity_bonus import get_diversity_metric
+            reward_kwargs["diversity_metric"] = get_diversity_metric(metric_name)
+            reward_kwargs["diversity_lambda_pos"] = diversity_bonus_config.get("lambda_pos", 0.0)
+            reward_kwargs["diversity_lambda_neg"] = diversity_bonus_config.get("lambda_neg", 0.0)
+            reward_kwargs["diversity_reward_threshold"] = diversity_bonus_config.get("reward_threshold", 0.5)
+
     # Instantiate and return the reward manager with the specified parameters
     return reward_manager_cls(
         tokenizer=tokenizer,

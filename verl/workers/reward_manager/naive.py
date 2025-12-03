@@ -13,11 +13,12 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import Any
+from typing import Any, Callable, Optional
 
 import torch
 
 from verl import DataProto
+from verl.utils.diversity_bonus import DiversityBonusComputer, DiversityMetricFn
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager
@@ -27,7 +28,17 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 class NaiveRewardManager(AbstractRewardManager):
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
+    def __init__(
+        self,
+        tokenizer,
+        num_examine,
+        compute_score=None,
+        reward_fn_key="data_source",
+        diversity_metric: Optional[DiversityMetricFn] = None,
+        diversity_lambda_pos: float = 0.0,
+        diversity_lambda_neg: float = 0.0,
+        diversity_reward_threshold: float = 0.5,
+    ) -> None:
         """
         Initialize the NaiveRewardManager instance.
 
@@ -37,11 +48,24 @@ class NaiveRewardManager(AbstractRewardManager):
             compute_score: A function to compute the reward score. If None, `default_compute_score` will be used.
             reward_fn_key: The key used to access the data source in the non-tensor batch data. Defaults to
                 "data_source".
+            diversity_metric: Function that takes two response strings and returns a diversity score [0, 1].
+                            If None, diversity bonus is disabled.
+            diversity_lambda_pos: Scaling factor for diversity bonus on correct responses.
+            diversity_lambda_neg: Scaling factor for diversity bonus on incorrect responses.
+            diversity_reward_threshold: Threshold to determine correct vs incorrect responses.
         """
         self.tokenizer = tokenizer  # Store the tokenizer for decoding token IDs
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
+        
+        # Initialize diversity bonus computer
+        self.diversity_bonus_computer = DiversityBonusComputer(
+            diversity_metric=diversity_metric,
+            lambda_pos=diversity_lambda_pos,
+            lambda_neg=diversity_lambda_neg,
+            reward_threshold=diversity_reward_threshold,
+        )
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
@@ -59,6 +83,11 @@ class NaiveRewardManager(AbstractRewardManager):
         reward_extra_info = defaultdict(list)
 
         already_print_data_sources = {}
+        
+        # Collect data for diversity bonus computation
+        responses_for_diversity: list[str] = []
+        rewards_for_diversity: list[float] = []
+        valid_response_lengths: list[int] = []
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
@@ -102,6 +131,11 @@ class NaiveRewardManager(AbstractRewardManager):
                 reward = score
 
             reward_tensor[i, valid_response_length - 1] = reward
+            
+            # Collect for diversity bonus
+            responses_for_diversity.append(response_str)
+            rewards_for_diversity.append(float(reward))
+            valid_response_lengths.append(int(valid_response_length))
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -116,6 +150,20 @@ class NaiveRewardManager(AbstractRewardManager):
                         print(f"[{key}]", value)
                 else:
                     print("[score]", score)
+
+        # Apply diversity bonus if enabled
+        if self.diversity_bonus_computer.enabled and "uid" in data.non_tensor_batch:
+            uids = list(data.non_tensor_batch["uid"])
+            reward_tensor, diversity_bonuses = self.diversity_bonus_computer.apply_to_reward_tensor(
+                reward_tensor=reward_tensor,
+                responses=responses_for_diversity,
+                rewards=rewards_for_diversity,
+                uids=uids,
+                valid_response_lengths=valid_response_lengths,
+            )
+            
+            # Store diversity bonus in extra info
+            reward_extra_info["diversity_bonus"] = diversity_bonuses
 
         if return_dict:
             return {
