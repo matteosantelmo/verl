@@ -49,6 +49,8 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+    compute_unique_answer_counts,
+    compute_entropy_metrics,
 )
 from verl.trainer.ppo.mismatch_helper import compute_rollout_importance_weights
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
@@ -1150,6 +1152,8 @@ class RayPPOTrainer:
 
                         # log problem difficulty metrics
                         metrics.update(compute_rollout_metrics(problem_acc))
+                        # compute unique answer counts
+                        metrics.update(compute_unique_answer_counts(batch, tokenizer=self.tokenizer))
 
                         # Filter problems based on their group average
                         problem_acc_per_sample = problem_acc[inverse_indices]
@@ -1166,7 +1170,6 @@ class RayPPOTrainer:
                         entropy_agg = masked_mean(entropys, response_masks)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
                         if "rollout_log_probs" in batch.batch.keys():
@@ -1202,6 +1205,11 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # compute entropy metrics and remove entropys
+                        metrics.update(compute_entropy_metrics(batch))
+                        if "entropys" in batch.batch:
+                            batch.batch.pop("entropys")
 
                         # Compute rollout importance sampling weights centrally (once per batch)
                         # This corrects for mismatch between rollout policy and training policy

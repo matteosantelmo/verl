@@ -24,6 +24,7 @@ import torch
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
+from verl.utils.torch_functional import masked_mean, masked_sum
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -272,6 +273,8 @@ def compute_rollout_metrics(problem_acc: np.ndarray) -> dict[str, Any]:
         "batch_info/acc_std": float(problem_acc.std()),
         "batch_info/acc_min": float(problem_acc.min()),
         "batch_info/acc_max": float(problem_acc.max()),
+        "batch_info/all_correct_frac": float(np.mean(problem_acc == 1.0)),
+        "batch_info/all_incorrect_frac": float(np.mean(problem_acc == 0.0)),
         "batch_info/acc_hist_0_frac": hist_fracs[0],
         "batch_info/acc_hist_0_0.25_frac": hist_fracs[1],
         "batch_info/acc_hist_0.25_0.5_frac": hist_fracs[2],
@@ -544,3 +547,154 @@ def process_validation_metrics(
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
 
     return data_src2var2metric2val
+
+
+def compute_entropy_metrics(batch: DataProto) -> dict[str, Any]:
+    """
+    Computes entropy-related metrics from a batch of data.
+    """
+    bins = torch.arange(0, 1, 0.2) + 0.2
+    binned_entropies = {b.item(): [] for b in bins}
+    p_entropies = []
+    n_entropies = []
+
+    binned_log_probs = {b.item(): [] for b in bins}
+    p_log_probs = []
+    n_log_probs = []
+
+    seq_level_entropies = masked_mean(batch.batch["entropys"], batch.batch["response_mask"], axis=-1)
+    seq_level_log_probs = masked_sum(batch.batch["old_log_probs"], batch.batch["response_mask"], axis=-1)
+    seq_level_scores = masked_sum(batch.batch["token_level_scores"], batch.batch["response_mask"], axis=-1)
+    uids = batch.non_tensor_batch["uid"]
+
+    for uid in set(uids):
+        # Get indices at which the current uid appears (leveraging that uids is a numpy array)
+        indices = (uids == uid).nonzero()[0]
+        rewards = seq_level_scores[indices]
+        entropies = seq_level_entropies[indices]
+        log_probs = seq_level_log_probs[indices]
+        
+        # Add the average entropy and log-probability in the bin corresponding to the accuracy
+        avg_group_acc = rewards.mean().item()
+        avg_group_entropy = entropies.mean().item()
+        avg_group_log_prob = log_probs.mean().item()
+        for b in bins:
+            if avg_group_acc <= b:
+                binned_entropies[b.item()].append(avg_group_entropy)
+                binned_log_probs[b.item()].append(avg_group_log_prob)
+                break
+
+        # Add to positive/negative entropies and log_probs
+        p_indices = indices[rewards > 0]
+        n_indices = indices[rewards <= 0]
+        p_entropies.extend(seq_level_entropies[p_indices].tolist())
+        n_entropies.extend(seq_level_entropies[n_indices].tolist())
+        p_log_probs.extend(seq_level_log_probs[p_indices].tolist())
+        n_log_probs.extend(seq_level_log_probs[n_indices].tolist())
+
+    p_entropies = torch.tensor(p_entropies)
+    n_entropies = torch.tensor(n_entropies)
+    p_log_probs = torch.tensor(p_log_probs)
+    n_log_probs = torch.tensor(n_log_probs)
+
+    metrics = {
+        "p_entropies/mean": p_entropies.mean().item(),
+        "n_entropies/mean": n_entropies.mean().item(),
+        "p_log_probs/mean": p_log_probs.mean().item(),
+        "n_log_probs/mean": n_log_probs.mean().item(),
+        **{"binned_entropies/mean/" + str(k): torch.tensor(v).mean().item() for k, v in binned_entropies.items()},
+        **{"binned_log_probs/mean/" + str(k): torch.tensor(v).mean().item() for k, v in binned_log_probs.items()},
+        "p_entropies/std": p_entropies.std().item(),
+        "n_entropies/std": n_entropies.std().item(),
+        "p_log_probs/std": p_log_probs.std().item(),
+        "n_log_probs/std": n_log_probs.std().item(),
+        **{"binned_entropies/std/" + str(k): torch.tensor(v).std().item() for k, v in binned_entropies.items()},
+        **{"binned_log_probs/std/" + str(k): torch.tensor(v).std().item() for k, v in binned_log_probs.items()},   
+    }
+
+    return {"entropy_metrics/" + k: v for k, v in metrics.items()}
+
+def compute_unique_answer_counts(batch: DataProto, tokenizer) -> dict[str, Any]:
+    """
+    For each group, computes:
+    - the number of unique final answers (using data-source specific extraction functions)
+    - the number of unique final answers in groups with only incorrect responses
+    - the number of unique incorrect final answers normalized by the number of incorrect responses
+    """
+
+    data_sources = batch.non_tensor_batch["data_source"]
+    
+    # Define data-source specific final-answer extraction
+    if all(data_sources == "openai/gsm8k"):
+        from verl.utils.reward_score.gsm8k import extract_solution
+        extract_fct = extract_solution
+    elif all(data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"] for data_source in data_sources):
+        from verl.utils.reward_score.math_reward import strip_string, remove_boxed, last_boxed_only_string
+        def extract_solution(response: str) -> str:
+            try:
+                string_in_last_boxed = last_boxed_only_string(response)
+                if string_in_last_boxed is not None:
+                    answer = remove_boxed(string_in_last_boxed)
+                    return strip_string(answer)
+                return response
+            except Exception:
+                return str(response)
+        extract_fct = extract_solution
+    else:
+        return {}
+    
+    responses = tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+    uids = batch.non_tensor_batch["uid"]
+    scores = batch.batch["token_level_scores"].sum(-1).cpu().numpy()
+
+    # Extract final answers
+    final_answers = np.array([extract_fct(r) for r in responses], dtype=object)
+    # Group by uid
+    unique_uids, inverse_indices = np.unique(uids, return_inverse=True)
+    n_groups = len(unique_uids)
+
+    # Initialize metrics
+    unique_counts = np.zeros(n_groups, dtype=np.int32)
+    unique_counts_all_incorrect = []
+    unique_incorrect_normalized = []
+
+    for group_idx in range(n_groups):
+        mask = inverse_indices == group_idx
+        group_answers = final_answers[mask]
+        group_scores = scores[mask]
+        
+        # Count unique (non-None) final answers
+        valid_answers = group_answers[group_answers != None]
+        n_unique = len(set(valid_answers))
+        unique_counts[group_idx] = n_unique
+
+        # Count separately for groups with 0 accuracy
+        if np.all(group_scores <= 0):
+            unique_counts_all_incorrect.append(n_unique)
+
+        # Count unique incorrect final answers normalized
+        incorrect_mask = group_scores <= 0
+        incorrect_answers = group_answers[incorrect_mask]
+        incorrect_answers = incorrect_answers[incorrect_answers != None]
+        n_incorrect = len(incorrect_answers)
+        if n_incorrect > 0:
+            unique_incorrect_normalized.append(len(set(incorrect_answers)) / n_incorrect)
+
+    metrics = {
+        "unique_answers/mean": unique_counts.mean(),
+        "unique_answers/max": unique_counts.max(),
+        "unique_answers/min": unique_counts.min(),
+    }
+
+    if unique_counts_all_incorrect:
+        arr = np.array(unique_counts_all_incorrect)
+        metrics["unique_answers_all_incorrect/mean"] = arr.mean()
+        metrics["unique_answers_all_incorrect/std"] = arr.std()
+
+    if unique_incorrect_normalized:
+        arr = np.array(unique_incorrect_normalized)
+        metrics["unique_incorrect_normalized/mean"] = arr.mean()
+        metrics["unique_incorrect_normalized/std"] = arr.std()
+
+    return {"final_answer_metrics/" + k: v for k, v in metrics.items()}
+    
