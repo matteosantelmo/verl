@@ -325,8 +325,10 @@ def math_equation_match_diversity(response1: str, response2: str) -> float:
 			answer = strip_string(answer)
 			return answer
 		except Exception as e:
-			return answer
+			return None
 
 	canonical1 = get_canonical_answer(response1)
 	canonical2 = get_canonical_answer(response2)
+	if canonical1 is None or canonical2 is None:
+		return 0.0
 	return 0.0 if canonical1 == canonical2 else 1.0

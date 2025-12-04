@@ -388,7 +388,7 @@ def _compute_pass_at_k(rewards: list[float], k: int) -> float:
         raise ValueError(f"Number of samples {n} must be at least k={k} to compute pass@k.")
 
     rewards = np.array(rewards)
-    num_success = np.sum(rewards > 0)
+    num_success = np.sum(rewards >= 1)
 
     if num_success == 0:
         return 0.0

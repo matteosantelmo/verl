@@ -108,7 +108,7 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
 
 
 def load_reward_manager(
-    config: DictConfig, tokenizer: Any, num_examine: int, **reward_kwargs: Any
+    config: DictConfig, tokenizer: Any, num_examine: int, apply_diversity_bonus: bool = False, **reward_kwargs: Any
 ) -> AbstractRewardManager:
     """
     Load and initialize a reward manager based on the configuration.
@@ -117,6 +117,7 @@ def load_reward_manager(
         config: PPO trainer configuration object containing reward_model fields.
         tokenizer: Tokenizer object used for processing text.
         num_examine: Number of samples to examine.
+        apply_diversity_bonus: Whether to apply diversity bonus (default False).
         **reward_kwargs: Additional keyword arguments for the reward manager.
 
     Returns:
@@ -158,7 +159,7 @@ def load_reward_manager(
 
     # Extract diversity bonus configuration
     diversity_bonus_config = config.reward_model.get("diversity_bonus", {})
-    if diversity_bonus_config.get("enable", False):
+    if apply_diversity_bonus and diversity_bonus_config.get("enable", False):
         metric_name = diversity_bonus_config.get("metric")
         if metric_name:
             from verl.utils.diversity_bonus import get_diversity_metric
