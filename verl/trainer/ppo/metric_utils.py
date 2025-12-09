@@ -19,6 +19,7 @@ from collections import defaultdict
 from functools import partial
 from typing import Any, Callable
 
+import math
 import numpy as np
 import torch
 
@@ -77,6 +78,22 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
         response_length=response_length,
     )
 
+def _compute_pass_at_k(rewards: list[float], k: int) -> float:
+    """
+    Compute the pass@k metric using the unbiased estimator.
+    """
+    n = len(rewards)
+    if n < k:
+        raise ValueError(f"Number of samples {n} must be at least k={k} to compute pass@k.")
+
+    rewards = np.array(rewards)
+    num_success = np.sum(rewards >= 1)
+
+    if num_success == 0:
+        return 0.0
+
+    pass_at_k = 1.0 - math.comb(n - num_success, k) / math.comb(n, k)
+    return pass_at_k
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     """
@@ -513,6 +530,7 @@ def process_validation_metrics(
                     ns.append(n_resps)
 
                     for n in ns:
+                        metric[f"pass@{n}"] = _compute_pass_at_k(rewards=var_vals, k=n)
                         [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
                             data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
                         )

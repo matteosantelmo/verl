@@ -426,7 +426,7 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, log_probs=None, entropies=None, data_sources=None, extra_infos=None):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -438,7 +438,15 @@ class RayPPOTrainer:
             "gts": gts,
             "score": scores,
             "step": [self.global_steps] * n,
+            "data_source": data_sources,
+            "extra_info": extra_infos,
         }
+        
+        # if provided, add log_prob and entropy information
+        if log_probs is not None and len(log_probs) == n:
+            base_data["log_prob"] = log_probs
+        if entropies is not None and len(entropies) == n:
+            base_data["entropy"] = entropies
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
@@ -470,6 +478,18 @@ class RayPPOTrainer:
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
+            # Extract log probabilities and entropies if available
+            log_probs = None
+            entropies = None
+            if "old_log_probs" in batch.batch:
+                response_mask = batch.batch.get("response_mask", compute_response_mask(batch))
+                log_probs_tensor = batch.batch["old_log_probs"]
+                log_probs = (log_probs_tensor * response_mask).sum(dim=-1).cpu().tolist()
+                
+                if "entropys" in batch.batch:
+                    entropies_tensor = batch.batch["entropys"]
+                    entropies = masked_mean(entropies_tensor, response_mask, axis=-1).cpu().tolist()
+
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_dict.setdefault(
@@ -482,6 +502,8 @@ class RayPPOTrainer:
                 outputs=outputs,
                 gts=sample_gts,
                 scores=scores,
+                log_probs=log_probs,
+                entropies=entropies,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
@@ -538,6 +560,10 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_log_probs = []
+        sample_entropies = []
+        sample_data_sources = []
+        sample_extra_infos = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -567,6 +593,16 @@ class RayPPOTrainer:
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
             ]
             sample_gts.extend(ground_truths)
+
+            data_sources = [
+                item.non_tensor_batch.get("data_source", "unknown") for item in test_batch
+            ]
+            sample_data_sources.extend(data_sources)
+            
+            extra_infos = [
+                item.non_tensor_batch.get("extra_info", {}) for item in test_batch
+            ]
+            sample_extra_infos.extend(extra_infos)
 
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
@@ -604,6 +640,25 @@ class RayPPOTrainer:
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
+            # Compute log probabilities and entropies of generated responses
+            if "response_mask" not in test_batch.batch.keys():
+                test_batch.batch["response_mask"] = compute_response_mask(test_batch)
+            
+            # Pad test batch to be divisible by actor worker group size
+            test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.actor_rollout_wg.world_size)
+            val_log_prob_output = self.actor_rollout_wg.compute_log_prob(test_batch_padded)
+            val_log_prob_output = unpad_dataproto(val_log_prob_output, pad_size=pad_size)
+            
+            val_log_probs = val_log_prob_output.batch["old_log_probs"]
+            val_entropies = val_log_prob_output.batch["entropys"]
+            response_mask = test_batch.batch["response_mask"]
+
+            val_log_probs_sum = (val_log_probs * response_mask).sum(dim=-1).cpu().tolist()
+            sample_log_probs.extend(val_log_probs_sum)
+
+            val_entropies_mean = masked_mean(val_entropies, response_mask, axis=-1).cpu().tolist()
+            sample_entropies.extend(val_entropies_mean)
+
             # evaluate using reward_function
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
@@ -633,6 +688,10 @@ class RayPPOTrainer:
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
+                log_probs=sample_log_probs,
+                entropies=sample_entropies,
+                data_sources=sample_data_sources,
+                extra_infos=sample_extra_infos,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
             )
