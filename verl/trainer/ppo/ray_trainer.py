@@ -644,20 +644,24 @@ class RayPPOTrainer:
             if "response_mask" not in test_batch.batch.keys():
                 test_batch.batch["response_mask"] = compute_response_mask(test_batch)
             
-            # Pad test batch to be divisible by actor worker group size
-            test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.actor_rollout_wg.world_size)
-            val_log_prob_output = self.actor_rollout_wg.compute_log_prob(test_batch_padded)
-            val_log_prob_output = unpad_dataproto(val_log_prob_output, pad_size=pad_size)
-            
-            val_log_probs = val_log_prob_output.batch["old_log_probs"]
-            val_entropies = val_log_prob_output.batch["entropys"]
-            response_mask = test_batch.batch["response_mask"]
+            if self.config.actor_rollout_ref.rollout.val_kwargs.n > 1:
+                # Pad test batch to be divisible by actor worker group size
+                test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.actor_rollout_wg.world_size)
+                val_log_prob_output = self.actor_rollout_wg.compute_log_prob(test_batch_padded)
+                val_log_prob_output = unpad_dataproto(val_log_prob_output, pad_size=pad_size)
+                
+                val_log_probs = val_log_prob_output.batch["old_log_probs"]
+                val_entropies = val_log_prob_output.batch["entropys"]
+                response_mask = test_batch.batch["response_mask"]
 
-            val_log_probs_sum = (val_log_probs * response_mask).sum(dim=-1).cpu().tolist()
-            sample_log_probs.extend(val_log_probs_sum)
+                val_log_probs_sum = (val_log_probs * response_mask).sum(dim=-1).cpu().tolist()
+                sample_log_probs.extend(val_log_probs_sum)
 
-            val_entropies_mean = masked_mean(val_entropies, response_mask, axis=-1).cpu().tolist()
-            sample_entropies.extend(val_entropies_mean)
+                val_entropies_mean = masked_mean(val_entropies, response_mask, axis=-1).cpu().tolist()
+                sample_entropies.extend(val_entropies_mean)
+            else:
+                sample_log_probs.extend([None] * len(output_texts))
+                sample_entropies.extend([None] * len(output_texts))
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
