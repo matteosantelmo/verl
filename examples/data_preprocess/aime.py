@@ -125,7 +125,7 @@ if __name__ == "__main__":
     # Map each subset
     aime2025_I_processed = aime2025_I_test.map(
         function=make_map_fn(
-            data_source=f"{args.aime_2025_path}/AIME2025-I",
+            data_source=args.aime_2025_path,
             split="aime_2025_test_I",
             question_key="question",
             answer_key="answer",
@@ -135,7 +135,7 @@ if __name__ == "__main__":
 
     aime2025_II_processed = aime2025_II_test.map(
         function=make_map_fn(
-            data_source=f"{args.aime_2025_path}/AIME2025-II",
+            data_source=args.aime_2025_path,
             split="aime_2025_test_II",
             question_key="question",
             answer_key="answer",
