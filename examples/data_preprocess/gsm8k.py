@@ -40,6 +40,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--local_save_dir", default="~/data/gsm8k", help="The save directory for the preprocessed dataset."
     )
+    parser.add_argument("--prompt_format", default="default", choices=["default", "boxed"], help="The format of the prompt.")
 
     args = parser.parse_args()
     local_dataset_path = args.local_dataset_path
@@ -55,6 +56,8 @@ if __name__ == "__main__":
     test_dataset = dataset["test"]
 
     instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+    if args.prompt_format == "boxed":
+        instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
@@ -66,7 +69,7 @@ if __name__ == "__main__":
             answer_raw = example.pop("answer")
             solution = extract_solution(answer_raw)
             data = {
-                "data_source": data_source,
+                "data_source": data_source + (f"_math_boxed" if args.prompt_format == "boxed" else ""),
                 "prompt": [
                     {
                         "role": "user",
