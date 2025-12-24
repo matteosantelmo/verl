@@ -105,6 +105,7 @@ class AdvantageEstimator(str, Enum):
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
+    DS_GRPO = "ds_grpo"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -326,6 +327,98 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.DS_GRPO)
+def compute_ds_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    seq_log_probs: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute advantages for Differential Smoothing GRPO (DS-GRPO).
+
+    This implements the variant from "Differential Smoothing Mitigates Sharpening and Improves LLM Reasoning",
+    which modifies outcome-only GRPO by adding a log-probability term that depends on whether a
+    trajectory is correct (positive reward) or incorrect (non-positive reward).
+
+    For each sample i in group g with scalar reward r_i and group mean mu_g, std sigma_g, we first
+    compute the base GRPO advantage
+
+        A_i = (r_i - mu_g) / sigma_g
+
+    (or without division by sigma_g when ``norm_adv_by_std_in_grpo`` is False). Then DS-GRPO modifies
+    this advantage as
+
+        A_i^DS = A_i - gamma_pos * log pi_old(y_i | x_i),   if r_i > 0
+                = A_i + gamma_neg * log pi_old(y_i | x_i),  otherwise,
+
+    where ``log pi_old(y_i | x_i)`` is the sequence-level log-probability under the rollout policy.
+
+    The resulting scalar is finally broadcast across the token dimension using ``response_mask``.
+    """
+    assert seq_log_probs.shape[0] == token_level_rewards.shape[0], "seq_log_probs must align with batch size"
+
+    # Sequence-level scalar rewards per sample
+    scores = token_level_rewards.sum(dim=-1)  # (bs,)
+
+    # Group statistics per prompt id
+    id2score = defaultdict(list)
+    id2mean: dict[Any, torch.Tensor] = {}
+    id2std: dict[Any, torch.Tensor] = {}
+
+    # Hyperparameters for DS-GRPO (default to 0.0 if not provided)
+    gamma_pos = 0.0
+    gamma_neg = 0.0
+    if config is not None:
+        # use getattr to stay robust to older configs without these fields
+        gamma_pos = float(getattr(config, "ds_grpo_gamma_pos", 0.0))
+        gamma_neg = float(getattr(config, "ds_grpo_gamma_neg", 0.0))
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0, device=scores.device, dtype=scores.dtype)
+                id2std[idx] = torch.tensor(1.0, device=scores.device, dtype=scores.dtype)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+        # Base GRPO scalar advantages per sequence
+        base_adv = torch.zeros_like(scores)
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                base_adv[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                base_adv[i] = scores[i] - id2mean[index[i]]
+
+        # Differential smoothing term based on correctness of the trajectory
+        # Positive trajectories are those with strictly positive scalar reward, matching existing
+        # entropy metric utilities which split on rewards > 0 vs <= 0.
+        pos_mask = scores > 0
+        neg_mask = ~pos_mask
+
+        ds_term = torch.zeros_like(base_adv)
+        if gamma_pos != 0.0:
+            ds_term[pos_mask] -= gamma_pos * seq_log_probs[pos_mask]
+        if gamma_neg != 0.0:
+            ds_term[neg_mask] += gamma_neg * seq_log_probs[neg_mask]
+
+        adv_scalars = base_adv + ds_term
+        advantages = adv_scalars.unsqueeze(-1) * response_mask
+
+    # As in outcome-only GRPO, we return the same tensor for advantages and returns.
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)

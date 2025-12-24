@@ -105,3 +105,10 @@ class AlgoConfig(BaseConfig):
     # True = apply weights to loss, False = compute metrics only (no weight application)
     rollout_is: bool = False
     rollout_is_self_norm: bool = False
+
+    # Differential Smoothing GRPO (DS-GRPO) hyperparameters.
+    # These control the strength of the log-probability based smoothing term applied on top of
+    # GRPO group-normalized advantages. They default to 0.0 so that, unless explicitly enabled
+    # in the config, behaviour is identical to vanilla GRPO.
+    ds_grpo_gamma_pos: float = 0.0
+    ds_grpo_gamma_neg: float = 0.0

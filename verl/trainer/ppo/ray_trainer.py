@@ -243,6 +243,22 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.DS_GRPO:
+        # Differential Smoothing GRPO (https://arxiv.org/pdf/2511.19942)
+        response_mask = data.batch["response_mask"]
+        # Compute sequence log probabilities for bonus/penalty calculation
+        seq_log_probs = (data.batch["old_log_probs"] * response_mask).sum(dim=-1)
+
+        advantages, returns = core_algos.compute_ds_grpo_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=response_mask,
+            index=data.non_tensor_batch["uid"],
+            seq_log_probs=seq_log_probs,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1223,6 +1239,9 @@ class RayPPOTrainer:
                         mask = (self.config.algorithm.group_average_low < problem_acc_per_sample) & (problem_acc_per_sample < self.config.algorithm.group_average_high)
                         batch = batch.select_idxs(np.where(mask)[0].tolist())
                         batch, _ = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
+                        metrics.update({
+                            "batch_info/problem_count_after_filtering": len(np.unique(batch.non_tensor_batch["uid"])),
+                        })
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
