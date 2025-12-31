@@ -106,6 +106,7 @@ class AdvantageEstimator(str, Enum):
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
     DS_GRPO = "ds_grpo"
+    NGRPO = "ngrpo"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -327,6 +328,69 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.NGRPO)
+def compute_ngrpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute advantage for NGRPO (Negative-enhanced GRPO) using Advantage Calibration (https://arxiv.org/pdf/2509.18851v1).
+
+    Args:
+        token_level_rewards: (bs, response_length)
+        response_mask: (bs, response_length)
+        index: (bs,) group id per sample, used to define GRPO-style groups
+        epsilon: small constant added to the std for numerical stability
+        norm_adv_by_std_in_grpo: if True, divide by the augmented std as in
+            normalized GRPO; if False, skip the std normalization and use
+            (r_i - mu_{R'}) directly.
+        config: optional AlgoConfig; if it has attribute ``ngrpo_max_reward``,
+            that value is used as ``r_max``. Otherwise we default to 1.0.
+
+    Returns:
+        advantages: (bs, response_length)
+        returns: (bs, response_length) - identical to advantages for
+            outcome-only GRPO-style training.
+    """
+    # Determine virtual maximum reward r_max. Paper uses the task's maximum
+    # reward (e.g. 1.0 for correctness rewards).
+    r_max = 1.0
+    if config is not None:
+        r_max = float(getattr(config, "ngrpo_max_reward", r_max))
+
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                augmented_scores = torch.cat([scores_tensor, torch.tensor([r_max], device=scores_tensor.device, dtype=scores_tensor.dtype)])
+                id2mean[idx] = torch.mean(augmented_scores)
+                id2std[idx] = torch.std(augmented_scores)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+        scores = scores.unsqueeze(-1) * response_mask
+
     return scores, scores
 
 

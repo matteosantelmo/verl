@@ -249,7 +249,7 @@ def compute_advantage(
         # Compute sequence log probabilities for bonus/penalty calculation
         seq_log_probs = (data.batch["old_log_probs"] * response_mask).sum(dim=-1)
 
-        advantages, returns = core_algos.compute_ds_grpo_advantage(
+        advantages, returns = core_algos.compute_ds_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=response_mask,
             index=data.non_tensor_batch["uid"],
