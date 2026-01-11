@@ -620,14 +620,14 @@ def compute_entropy_metrics(batch: DataProto) -> dict[str, Any]:
         "n_entropies/mean": n_entropies.mean().item(),
         "p_log_probs/mean": p_log_probs.mean().item(),
         "n_log_probs/mean": n_log_probs.mean().item(),
-        **{"binned_entropies/mean/" + str(k): torch.tensor(v).mean().item() for k, v in binned_entropies.items()},
-        **{"binned_log_probs/mean/" + str(k): torch.tensor(v).mean().item() for k, v in binned_log_probs.items()},
+        **{f"binned_entropies/mean/{k:.2f}": torch.tensor(v).mean().item() for k, v in binned_entropies.items()},
+        **{f"binned_log_probs/mean/{k:.2f}": torch.tensor(v).mean().item() for k, v in binned_log_probs.items()},
         "p_entropies/std": p_entropies.std().item(),
         "n_entropies/std": n_entropies.std().item(),
         "p_log_probs/std": p_log_probs.std().item(),
         "n_log_probs/std": n_log_probs.std().item(),
-        **{"binned_entropies/std/" + str(k): torch.tensor(v).std().item() for k, v in binned_entropies.items()},
-        **{"binned_log_probs/std/" + str(k): torch.tensor(v).std().item() for k, v in binned_log_probs.items()},   
+        **{f"binned_entropies/std/{k:.2f}": torch.tensor(v).std().item() for k, v in binned_entropies.items()},
+        **{f"binned_log_probs/std/{k:.2f}": torch.tensor(v).std().item() for k, v in binned_log_probs.items()},   
     }
 
     return {"entropy_metrics/" + k: v for k, v in metrics.items()}

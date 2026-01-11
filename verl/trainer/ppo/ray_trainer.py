@@ -1213,6 +1213,26 @@ class RayPPOTrainer:
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
+                    # recompute old_log_probs
+                    # NOTE: we do this before the filtering (despite less efficient)
+                    # to be able to track pre-filtering entropy
+                    with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        entropys = old_log_prob.batch["entropys"]
+                        response_masks = batch.batch["response_mask"]
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        entropy_agg = masked_mean(entropys, response_masks)
+                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                        metrics.update(old_log_prob_metrics)
+                        batch = batch.union(old_log_prob)
+
+                        if "rollout_log_probs" in batch.batch.keys():
+                            # TODO: we may want to add diff of probs too.
+                            from verl.utils.debug.metrics import calculate_debug_metrics
+
+                            metrics.update(calculate_debug_metrics(batch))
+
+
                     with marked_timer("group_average_filtering", timing_raw, color="blue"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
@@ -1224,6 +1244,11 @@ class RayPPOTrainer:
                         uids = batch.non_tensor_batch["uid"]
                         acc_values = batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy()
                         
+                        # Compute and log entropy metrics that required token-level scores
+                        metrics.update(compute_entropy_metrics(batch))
+                        if "entropys" in batch.batch:
+                            batch.batch.pop("entropys")
+
                         # Compute per-problem accuracy
                         unique_uids, inverse_indices = np.unique(uids, return_inverse=True)
                         counts = np.bincount(inverse_indices)
@@ -1242,23 +1267,6 @@ class RayPPOTrainer:
                         metrics.update({
                             "batch_info/problem_count_after_filtering": len(np.unique(batch.non_tensor_batch["uid"])),
                         })
-
-                    # recompute old_log_probs
-                    with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = masked_mean(entropys, response_masks)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        batch = batch.union(old_log_prob)
-
-                        if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            from verl.utils.debug.metrics import calculate_debug_metrics
-
-                            metrics.update(calculate_debug_metrics(batch))
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -1287,11 +1295,6 @@ class RayPPOTrainer:
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # compute entropy metrics and remove entropys
-                        metrics.update(compute_entropy_metrics(batch))
-                        if "entropys" in batch.batch:
-                            batch.batch.pop("entropys")
 
                         # Compute rollout importance sampling weights centrally (once per batch)
                         # This corrects for mismatch between rollout policy and training policy
