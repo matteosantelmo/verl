@@ -18,6 +18,7 @@ A unified tracking interface that supports logging data to different backend
 import dataclasses
 import json
 import os
+import random
 import subprocess
 import time
 from enum import Enum
@@ -78,7 +79,7 @@ class Tracking:
                 name=experiment_name,
                 config=config,
                 settings=settings,
-                mode="offline",
+                mode=os.getenv("WANDB_MODE", "offline"),
             )
             self.logger["wandb"] = wandb
             self.wandb_cache = []
@@ -91,8 +92,6 @@ class Tracking:
             self.logger["trackio"] = trackio
 
         if "mlflow" in default_backend:
-            import os
-
             import mlflow
 
             MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "sqlite:////tmp/mlruns.db")
@@ -106,8 +105,6 @@ class Tracking:
             self.logger["mlflow"] = _MlflowLoggingAdapter()
 
         if "swanlab" in default_backend:
-            import os
-
             import swanlab
 
             SWANLAB_API_KEY = os.environ.get("SWANLAB_API_KEY", None)
@@ -128,8 +125,6 @@ class Tracking:
             self.logger["swanlab"] = swanlab
 
         if "vemlp_wandb" in default_backend:
-            import os
-
             import volcengine_ml_platform
             from volcengine_ml_platform import wandb as vemlp_wandb
 
@@ -166,10 +161,8 @@ class Tracking:
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
                 if default_backend == "wandb":
-                    import wandb
-
                     if step >= self.wandb_step:
-                        self.wandb_cache.append((step, data))
+                        logger_instance.log(data=data, step=step)
                         self.wandb_step = step
                     else:
                         self.wandb_cache.append((step, data))
@@ -514,7 +507,7 @@ class ValidationGenerationsLogger:
 
 @dataclasses.dataclass
 class RolloutGenerationsLogger:
-    """Logger for rollout generations that logs detailed generation data to wandb.
+    """Log rollout generations to local JSONL files and W&B.
 
     Each generation entry contains:
     - task_id: The ID of the task
@@ -529,18 +522,37 @@ class RolloutGenerationsLogger:
     experiment_name: str = None
     default_local_dir: str = None
 
-    def log(self, loggers, generations_data: list[dict], step: int):
+    def log(self, loggers, generations_data: list[dict], step: int, rollout_step: int | None = None):
         """Log generation data to enabled backends.
 
         Args:
             loggers: Dictionary of logger instances
-            generations_data: List of dicts with keys: task_id, input, output, metrics, sampling_params, finish_reason, and other metadata
-            step: Current training step
+            generations_data: Generated rollout records
+            step: Current training step used for W&B logging
+            rollout_step: Step of the model that generated the rollouts
         """
-        if "wandb" in loggers:
-            self.log_generations_to_wandb(loggers["wandb"], generations_data, step)
+        rollout_step = step if rollout_step is None else rollout_step
+        self.save_generations_locally(generations_data, step, rollout_step)
 
-    def log_generations_to_wandb(self, wandb, generations_data: list[dict], step: int):
+        if "wandb" in loggers:
+            sampled_generations = random.sample(generations_data, min(64, len(generations_data)))
+            self.log_generations_to_wandb(loggers["wandb"], sampled_generations, step, rollout_step)
+
+    def save_generations_locally(self, generations_data: list[dict], step: int, rollout_step: int):
+        if not self.default_local_dir or not generations_data:
+            return
+
+        output_dir = Path(self.default_local_dir) / "rollout_generations"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"step_{rollout_step}.jsonl"
+        with output_path.open("w", encoding="utf-8") as f:
+            for generation in generations_data:
+                record = {"step": step, "rollout_step": rollout_step, **generation}
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def log_generations_to_wandb(
+        self, wandb, generations_data: list[dict], step: int, rollout_step: int
+    ):
         if not generations_data:
             return
 
@@ -550,7 +562,16 @@ class RolloutGenerationsLogger:
             all_keys.update(gen.keys())
 
         # Define column order: step first, then common fields, then others
-        priority_columns = ["step", "task_id", "input", "output", "metrics", "sampling_params", "finish_reason"]
+        priority_columns = [
+            "step",
+            "rollout_step",
+            "task_id",
+            "input",
+            "output",
+            "metrics",
+            "sampling_params",
+            "finish_reason",
+        ]
         other_columns = sorted([k for k in all_keys if k not in priority_columns])
         columns = priority_columns + other_columns
 
@@ -559,8 +580,8 @@ class RolloutGenerationsLogger:
 
         # Add rows
         for gen in generations_data:
-            row_data = [step]  # step column
-            for col in priority_columns[1:]:  # skip step, already added
+            row_data = [step, rollout_step]
+            for col in priority_columns[2:]:  # skip step columns, already added
                 value = gen.get(col, "")
                 # Convert dicts to JSON strings for wandb table display
                 if isinstance(value, dict):
@@ -584,5 +605,10 @@ class RolloutGenerationsLogger:
 
 def _sync_offline_wandb(wandb, default_local_dir):
     wandb_dir = os.path.join(default_local_dir, "wandb")
-    run_dir = os.path.join(wandb_dir, [d for d in os.listdir(wandb_dir) if d.startswith("offline")][0])
+    if not os.path.isdir(wandb_dir):
+        return
+    offline_runs = [d for d in os.listdir(wandb_dir) if d.startswith("offline")]
+    if not offline_runs:
+        return
+    run_dir = os.path.join(wandb_dir, offline_runs[0])
     subprocess.Popen(["wandb", "sync", run_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

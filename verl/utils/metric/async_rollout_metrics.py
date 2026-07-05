@@ -1,5 +1,4 @@
 import time
-import random
 import asyncio
 import aiohttp
 from dataclasses import asdict
@@ -351,10 +350,7 @@ class AsyncRolloutMetrics:
         aggregated_metrics["rollout/clip_length"] = sum(clip_lengths) / len(clip_lengths)
         aggregated_metrics["rollout/clip_degeneration"] = sum(clip_degenerations) / len(clip_degenerations)
 
-        # Sample generations for logging (limit to avoid too large tables)
-        sampled_generations = random.sample(generations_data, min(256, len(generations_data)))
-
-        return aggregated_metrics, sampled_generations
+        return aggregated_metrics, generations_data
 
     def compute_metrics(self) -> tuple[dict[str, float], list[dict[str, Any]]]:
         """Compute metrics synchronously (for standalone mode)."""

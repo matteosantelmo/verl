@@ -118,6 +118,12 @@ class SFTTrainer:
 
         self.rollout_url = getattr(self.config, "rollout_url", None)
 
+    def _validation_enabled(self):
+        test_freq = self.config.trainer.test_freq
+        if test_freq == "after_each_epoch":
+            return True
+        return test_freq is not None and test_freq > 0
+
     def _build_engine(self):
         from verl.workers.engine import BaseEngine, EngineRegistry
 
@@ -155,7 +161,9 @@ class SFTTrainer:
         config = self.config
         tokenizer = self.model_config.tokenizer
         train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
-        val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
+        val_dataset = None
+        if self._validation_enabled():
+            val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
 
         if hasattr(config.data, "rollout_files") and config.data.rollout_files is not None:
             if self.rank == 0:
@@ -202,21 +210,25 @@ class SFTTrainer:
             pin_memory_device=device_name,
         )
 
-        val_batch_size_per_dp = (config.data.val_batch_size or self.global_batch_size) // dp_size
+        if self.val_dataset is not None:
+            val_batch_size_per_dp = (config.data.val_batch_size or self.global_batch_size) // dp_size
 
-        self.val_sampler = DistributedSampler(
-            self.val_dataset, shuffle=False, num_replicas=dp_size, rank=dp_rank, drop_last=True
-        )
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=val_batch_size_per_dp,
-            sampler=self.val_sampler,
-            collate_fn=collate_fn,
-            num_workers=8,
-            pin_memory=True,
-            drop_last=True,
-            pin_memory_device=device_name,
-        )
+            self.val_sampler = DistributedSampler(
+                self.val_dataset, shuffle=False, num_replicas=dp_size, rank=dp_rank, drop_last=True
+            )
+            self.val_dataloader = StatefulDataLoader(
+                dataset=self.val_dataset,
+                batch_size=val_batch_size_per_dp,
+                sampler=self.val_sampler,
+                collate_fn=collate_fn,
+                num_workers=8,
+                pin_memory=True,
+                drop_last=True,
+                pin_memory_device=device_name,
+            )
+        else:
+            self.val_sampler = None
+            self.val_dataloader = None
 
     def _build_rollout_metrics(self):
         if self.rank == 0 and self.rollout_dataset is not None:
@@ -233,6 +245,8 @@ class SFTTrainer:
 
     def _validate_rollout(self, is_logging, global_step, tracking, meta_info, rollout_generation_log_fn):
         last_valid_metric = None
+        if self.val_dataloader is None:
+            return last_valid_metric
 
         # Perform validation
         val_losses = []
@@ -280,9 +294,17 @@ class SFTTrainer:
                 rollout_metrics, generations_data = rollout_result
                 if rollout_metrics:
                     print(f"{rollout_metrics=}")
-                    tracking.log(data=rollout_metrics, step=rollout_step)
+                    # W&B steps must be monotonic; rollout_step is one async evaluation behind global_step.
+                    tracking.log(
+                        data={"rollout/model_step": rollout_step, **rollout_metrics},
+                        step=global_step,
+                    )
                 if rollout_generation_log_fn is not None and generations_data:
-                    rollout_generation_log_fn(generations_data=generations_data, step=rollout_step)
+                    rollout_generation_log_fn(
+                        generations_data=generations_data,
+                        step=global_step,
+                        rollout_step=rollout_step,
+                    )
             tracking.log(data=metric, step=global_step)
             last_valid_metric = metric
         torch.distributed.barrier()
@@ -353,7 +375,10 @@ class SFTTrainer:
             "response_length": 256,
         }
 
-        last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info, rollout_generation_log_fn)
+        if self.test_freq > 0:
+            last_valid_metric = self._validate_rollout(
+                is_logging, global_step, tracking, meta_info, rollout_generation_log_fn
+            )
 
         train_time = 0
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
@@ -461,11 +486,11 @@ class SFTTrainer:
                         print(f"[Step {global_step}] Stopped CUDA profiler - profile data saved")
 
                 is_last_step = global_step >= self.total_training_steps
-                is_valid_step = global_step % self.test_freq == 0
+                is_valid_step = self.test_freq > 0 and global_step % self.test_freq == 0
                 is_save_step = global_step % self.save_freq == 0
 
                 # early exit or validation step
-                if is_last_step or (self.test_freq > 0 and is_valid_step):
+                if self.test_freq > 0 and (is_last_step or is_valid_step):
                     last_valid_metric = self._validate_rollout(is_logging, global_step, tracking, meta_info, rollout_generation_log_fn)
 
                 if is_last_step or (self.save_freq > 0 and is_save_step):
@@ -477,9 +502,17 @@ class SFTTrainer:
                             rollout_result, rollout_step = self.rollout_metrics.wait_compute_metrics()
                             rollout_metrics, generations_data = rollout_result
                             if rollout_metrics:
-                                tracking.log(data=rollout_metrics, step=rollout_step, force_sync=True)
+                                tracking.log(
+                                    data={"rollout/model_step": rollout_step, **rollout_metrics},
+                                    step=global_step,
+                                    force_sync=True,
+                                )
                             if rollout_generation_log_fn is not None and generations_data:
-                                rollout_generation_log_fn(generations_data=generations_data, step=rollout_step)
+                                rollout_generation_log_fn(
+                                    generations_data=generations_data,
+                                    step=global_step,
+                                    rollout_step=rollout_step,
+                                )
 
                         print(f"Total time for train steps: {train_time:.2f}s")
                         print(f"Final validation metrics: {last_valid_metric}")
