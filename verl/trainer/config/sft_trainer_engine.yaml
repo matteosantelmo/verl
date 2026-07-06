@@ -16,6 +16,13 @@ data:
   train_batch_size: 256 # global batch size
   val_batch_size: null
   rollout_batch_size: null
+
+  # Sampling overrides applied to every rollout-evaluation prompt.
+  rollout_sampling_params: {}
+
+  # Maximum number of in-flight requests to the rollout router.
+  rollout_max_concurrent_requests: 1024
+
   micro_batch_size_per_gpu: 4  # this is also val batch size
   max_token_len_per_gpu: 8192
   use_dynamic_bsz: True

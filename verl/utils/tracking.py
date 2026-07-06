@@ -513,7 +513,8 @@ class RolloutGenerationsLogger:
     - task_id: The ID of the task
     - input: The input prompt text
     - output: The generated text
-    - metrics: Dict of all computed metrics
+    - sample_metrics: Metrics for this generated response
+    - correct: Whether this response fully solved the task
     - sampling_params: Dict of sampling parameters used
     - finish_reason: Why generation stopped (stop, length, degenerating, error)
     - Additional metadata from rollout_params
@@ -568,7 +569,8 @@ class RolloutGenerationsLogger:
             "task_id",
             "input",
             "output",
-            "metrics",
+            "correct",
+            "sample_metrics",
             "sampling_params",
             "finish_reason",
         ]

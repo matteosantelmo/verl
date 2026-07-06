@@ -239,6 +239,8 @@ class SFTTrainer:
                 master_port=int(os.environ["MASTER_PORT"]) + 1,
                 rollout_batch_size=self.config.data.rollout_batch_size,
                 pad_token_id=3,  # TODO: fix this
+                sampling_params=dict(getattr(self.config.data, "rollout_sampling_params", {})),
+                max_concurrent_requests=getattr(self.config.data, "rollout_max_concurrent_requests", 1024),
             )
         else:
             self.rollout_metrics = None
