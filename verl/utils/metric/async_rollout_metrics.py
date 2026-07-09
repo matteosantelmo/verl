@@ -16,7 +16,12 @@ from torch.utils.data import DataLoader
 from verl.utils.dataset.multiturn_sft_dataset import MultiTurnSFTDataset
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.device import get_device_name
-from verl.utils.metric.rollout_tasks import RolloutParams, compute_default_metrics, get_task
+from verl.utils.metric.rollout_tasks import (
+    RolloutParams,
+    compute_default_metrics,
+    get_task,
+    prepare_instruction_following_dependencies,
+)
 from verl.utils.metric.utils import compute_token_ttr
 from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
 
@@ -141,6 +146,7 @@ class AsyncRolloutMetrics:
         self.compute_metrics_step = 0
         self.compute_metrics_future = None
 
+        prepare_instruction_following_dependencies()
         self.process_pool = ProcessPoolExecutor(max_workers=num_workers)
 
         # Consume all the data to avoid having tokenizers issues
@@ -351,6 +357,8 @@ class AsyncRolloutMetrics:
         clip_lengths = []
         clip_degenerations = []
         generations_data = []
+        generation_time = 0.0
+        verification_time = 0.0
         tokenizer = self.rollout_dataset.tokenizer
         for i, batch in enumerate(self.batched_data):
             clip_length = 0
@@ -363,7 +371,9 @@ class AsyncRolloutMetrics:
 
             input_texts = [tokenizer.decode(ids, skip_special_tokens=False) for ids in unpadded_input_ids]
 
+            generation_start = time.perf_counter()
             outputs = asyncio.run(self._async_generate_batch(unpadded_input_ids, sampling_params))
+            generation_time += time.perf_counter() - generation_start
 
             len_outputs = 0
             for output in outputs:
@@ -377,6 +387,7 @@ class AsyncRolloutMetrics:
             clip_length /= len_outputs
             clip_degeneration /= len_outputs
 
+            verification_start = time.perf_counter()
             # Submit metric computation tasks to separate processes
             futures = []
             for output, params in zip(outputs, batch_params, strict=True):
@@ -424,6 +435,8 @@ class AsyncRolloutMetrics:
 
                     generations_data.append(generation_data)
 
+            verification_time += time.perf_counter() - verification_start
+
             clip_lengths.append(clip_length)
             clip_degenerations.append(clip_degeneration)
 
@@ -436,6 +449,13 @@ class AsyncRolloutMetrics:
 
         aggregated_metrics["rollout/clip_length"] = sum(clip_lengths) / len(clip_lengths)
         aggregated_metrics["rollout/clip_degeneration"] = sum(clip_degenerations) / len(clip_degenerations)
+        aggregated_metrics["rollout/generation_time_sec"] = generation_time
+        aggregated_metrics["rollout/verification_time_sec"] = verification_time
+        print(
+            "rollout timing: "
+            f"generation={generation_time:.2f}s, "
+            f"verification={verification_time:.2f}s"
+        )
 
         return aggregated_metrics, generations_data
 

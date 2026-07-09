@@ -15,6 +15,43 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+def _load_json_maybe(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return loads(value)
+    except Exception:
+        return value
+
+
+def _infer_task_id(data: dict[str, Any]) -> str:
+    task_id = data.get("id")
+    if task_id:
+        return str(task_id)
+
+    task_name = str(data.get("task_name") or "")
+    data_source = str(data.get("data_source") or "")
+    if task_name in TASK_REGISTRY:
+        return task_name
+    if task_name in {"math500", "aime2024", "aime2025"}:
+        return "math"
+    if task_name in {"gpqa_diamond", "mmlu"}:
+        return "mcq"
+
+    data_source_map = {
+        "openai/gsm8k": "gsm8k",
+        "HuggingFaceH4/MATH-500": "math",
+        "aime2024": "math",
+        "aime2025": "math",
+        "gpqa_diamond": "mcq",
+        "mmlu": "mcq",
+        "humaneval": "humaneval",
+        "google/IFEval": "ifeval",
+        "allenai/IFBench_test": "ifbench",
+    }
+    return data_source_map.get(data_source, "")
+
+
 @dataclass
 class RolloutParams:
     """Dataclass for task rollout parameters."""
@@ -28,18 +65,54 @@ class RolloutParams:
     @classmethod
     def from_dict(cls, data: dict) -> RolloutParams:
         # Extract known fields
-        known_fields = {"id", "task_name", "answer", "use_tool", "sampling_params", "kwargs"}
-        kwargs = data.get("kwargs", {})
+        known_fields = {
+            "id",
+            "data_source",
+            "task_name",
+            "answer",
+            "ground_truth",
+            "extra_info",
+            "use_tool",
+            "sampling_params",
+            "kwargs",
+        }
+        kwargs = dict(data.get("kwargs", {}))
 
         # Put any extra fields into kwargs
         for key, value in data.items():
             if key not in known_fields:
                 kwargs[key] = value
 
+        ground_truth = data.get("ground_truth")
+        extra_info = data.get("extra_info")
+        if isinstance(extra_info, dict):
+            kwargs.setdefault("extra_info", extra_info)
+            for key, value in extra_info.items():
+                if value is not None:
+                    kwargs.setdefault(key, value)
+
+        parsed_ground_truth = _load_json_maybe(ground_truth)
+        if isinstance(parsed_ground_truth, dict):
+            for key, value in parsed_ground_truth.items():
+                kwargs.setdefault(key, value)
+            if "instruction_id" in parsed_ground_truth:
+                kwargs["instruction_id_list"] = parsed_ground_truth["instruction_id"]
+            if "kwargs" in parsed_ground_truth:
+                kwargs["instruction_kwargs"] = parsed_ground_truth["kwargs"]
+
+        if isinstance(kwargs.get("instruction_id_list"), str):
+            kwargs["instruction_id_list"] = _load_json_maybe(kwargs["instruction_id_list"])
+        if isinstance(kwargs.get("instruction_kwargs"), str):
+            kwargs["instruction_kwargs"] = _load_json_maybe(kwargs["instruction_kwargs"])
+
+        answer = data.get("answer")
+        if answer is None:
+            answer = ground_truth
+
         return cls(
-            id=data.get("id", ""),
+            id=_infer_task_id(data),
             task_name=data.get("task_name", ""),
-            answer=data.get("answer"),
+            answer=answer,
             use_tool=data.get("use_tool", True),
             sampling_params=data.get("sampling_params", {}),
             kwargs=kwargs,
@@ -148,21 +221,23 @@ def compute_default_metrics(output: dict[str, Any]) -> dict[str, float]:
 # =============================================================================
 
 @lru_cache(maxsize=1)
-def _get_math_verify_metric():
-    from math_verify.metric import math_metric
+def _get_math_verify_objects():
+    from math_verify.grader import verify
     from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+    from math_verify.parser import parse
 
-    return math_metric(
-        gold_extraction_target=(LatexExtractionConfig(),),
-        pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),
-    )
+    return parse, verify, LatexExtractionConfig, ExprExtractionConfig
 
 
 def _math_verify_score(model_output: str, ground_truth: str) -> float:
     """Score a mathematical response with Hugging Face math_verify."""
-    gold = ground_truth if "\\boxed" in ground_truth else f"\\boxed{{{ground_truth}}}"
-    score, _ = _get_math_verify_metric()([gold], [model_output])
-    return float(score)
+    parse, verify, LatexExtractionConfig, ExprExtractionConfig = _get_math_verify_objects()
+    ground_truth_boxed = ground_truth if "\\boxed" in ground_truth else f"\\boxed{{{ground_truth}}}"
+    extracted_gold = parse(ground_truth_boxed, (LatexExtractionConfig(),))
+    extracted_pred = parse(model_output, (ExprExtractionConfig(), LatexExtractionConfig()))
+    if extracted_gold and extracted_pred:
+        return max(1.0 if any(verify(gold, pred) for gold in extracted_gold) else 0.0 for pred in extracted_pred)
+    return 0.0
 
 def math_task(output: dict[str, Any] | list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:
     """
@@ -494,6 +569,7 @@ def humaneval_thinking_task(outputs: list[dict[str, Any]], params: RolloutParams
 
 from .ifeval.instructions_registry import INSTRUCTION_DICT as IFEVAL_INSTRUCTION_DICT
 from .ifbench.instructions_registry import INSTRUCTION_DICT as IFBENCH_INSTRUCTION_DICT
+from .ifbench.instructions_util import _safe_nltk_download
 
 
 def parse_non_reasoning_apertus(output_text: str) -> str:
@@ -501,6 +577,18 @@ def parse_non_reasoning_apertus(output_text: str) -> str:
     if "<|inner_suffix|>" in output_text:
         output_text = output_text.split("<|inner_suffix|>")[1]
     return output_text.strip()
+
+
+@lru_cache(maxsize=1)
+def prepare_instruction_following_dependencies() -> None:
+    """Prepare NLTK data needed by IFEval/IFBench before worker processes fork."""
+    for resource in (
+        "tokenizers/punkt",
+        "tokenizers/punkt_tab",
+        "taggers/averaged_perceptron_tagger_eng",
+        "stopwords",
+    ):
+        _safe_nltk_download(resource)
 
 
 def ifeval_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:

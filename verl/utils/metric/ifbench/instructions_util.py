@@ -1552,25 +1552,34 @@ WORD_LIST = [
 
 def _safe_nltk_download(resource):
     """Safe download NLTK resource with filelock"""
+    download_name = resource.split("/")[-1]
     lock_path = os.path.join(os.path.expanduser("~"), f"nltk_download_{resource.replace('/', '_')}.lock")
+
+    def _find_resource():
+        if resource in {"punkt", "tokenizers/punkt"}:
+            nltk.data.find("tokenizers/punkt/english.pickle")
+        elif resource == "stopwords":
+            nltk.corpus.stopwords.words("english")
+        elif resource in {"punkt_tab", "tokenizers/punkt_tab"}:
+            nltk.data.find("tokenizers/punkt_tab/english/collocations.tab")
+        elif resource in {"averaged_perceptron_tagger_eng", "taggers/averaged_perceptron_tagger_eng"}:
+            nltk.data.find("taggers/averaged_perceptron_tagger_eng/averaged_perceptron_tagger_eng.weights.json")
+        else:
+            nltk.data.find(resource)
+
     with FileLock(lock_path):
         try:
-            if resource == "tokenizers/punkt":
-                nltk.data.find("tokenizers/punkt")
-            elif resource == "stopwords":
-                nltk.corpus.stopwords.words("english")
-            elif resource == "tokenizers/punkt_tab":
-                nltk.data.find("tokenizers/punkt_tab")
-            elif resource == "taggers/averaged_perceptron_tagger_eng":
-                nltk.data.find("taggers/averaged_perceptron_tagger_eng")
-            else:
-                nltk.download(resource, quiet=True)
+            _find_resource()
         except (LookupError, OSError):
-            nltk.download(resource, quiet=True)
+            downloaded = nltk.download(download_name, quiet=True)
+            if not downloaded:
+                raise RuntimeError(f"Failed to download NLTK resource: {download_name}")
+            _find_resource()
 
 def download_nltk_resources():
-    """Download 'punkt' if not already installed"""
+    """Download sentence tokenizer resources if not already installed."""
     _safe_nltk_download("tokenizers/punkt")
+    _safe_nltk_download("tokenizers/punkt_tab")
 
 
 # download_nltk_resources()  # Do not call at import time to avoid race conditions during module loading
