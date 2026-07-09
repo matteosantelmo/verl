@@ -443,34 +443,74 @@ class MultiTurnSFTDataset(Dataset):
                 "response_mask": response_loss_mask,
             }
 
-# TODO: Verify these token IDs match the tokenizer of Apertus 1.5
-SYSTEM_TOKEN = 61
-END_SYSTEM_TOKEN = 62
-DEVELOPER_TOKEN = 63
-END_DEVELOPER_TOKEN = 64
-USER_TOKEN = 65
-END_USER_TOKEN = 66
-ASSISTANT_TOKEN = 67
-END_ASSISTANT_TOKEN = 68
-INNER_TOKEN = 69
-OUTER_TOKEN = 70
-TOOL_CALLS_TOKEN = 71
-END_TOOL_CALLS_TOKEN = 72
-
-
 class ApertusSFTDataset(MultiTurnSFTDataset):
+    ASSISTANT_TOKEN = "<|assistant_start|>"
+    END_ASSISTANT_TOKEN = "<|assistant_end|>"
+    INNER_TOKEN = "<|inner_prefix|>"
+    OUTER_TOKEN = "<|inner_suffix|>"
+    TOOL_CALLS_TOKEN = "<|tools_prefix|>"
+    TOOL_OUTPUT_TOKEN_PAIRS = (
+        ("<|tool_output_start|>", "<|tool_output_end|>"),   # v1.5
+        ("[TOOL_RESULTS]", "[/TOOL_RESULTS]"),  # v1
+    )
+
     def __init__(self, parquet_files: str | list[str], tokenizer, config=None):
         super().__init__(parquet_files, tokenizer, config)
 
+        config = config or {}
         self.only_tools_special_tokens = config.get("only_tools_special_tokens", False)
+
+        self.assistant_token_id = self._resolve_special_token_id(self.ASSISTANT_TOKEN)
+        self.end_assistant_token_id = self._resolve_special_token_id(self.END_ASSISTANT_TOKEN)
+        self.inner_token_id = self._resolve_special_token_id(self.INNER_TOKEN)
+        self.outer_token_id = self._resolve_special_token_id(self.OUTER_TOKEN)
+        self.tool_calls_token_id = self._resolve_special_token_id(self.TOOL_CALLS_TOKEN)
+        self.end_tool_calls_token_id = self._resolve_special_token_id(self.END_TOOL_CALLS_TOKEN)
+
+        chat_template = self.tokenizer.chat_template or ""
+        self.tool_output_start_token = "["
+        self.tool_output_end_token = "]"
+        self.tool_outputs_use_special_tokens = False
+        for start_token, end_token in self.TOOL_OUTPUT_TOKEN_PAIRS:
+            if start_token in chat_template:
+                self.tool_output_start_token = start_token
+                self.tool_output_end_token = end_token
+                self.tool_outputs_use_special_tokens = True
+                break
+
+        resolved = {
+            self.ASSISTANT_TOKEN: self.assistant_token_id,
+            self.END_ASSISTANT_TOKEN: self.end_assistant_token_id,
+            self.INNER_TOKEN: self.inner_token_id,
+            self.OUTER_TOKEN: self.outer_token_id,
+            self.TOOL_CALLS_TOKEN: self.tool_calls_token_id,
+            self.END_TOOL_CALLS_TOKEN: self.end_tool_calls_token_id,
+        }
+        if self.tool_outputs_use_special_tokens:
+            resolved[self.tool_output_start_token] = self._resolve_special_token_id(self.tool_output_start_token)
+            resolved[self.tool_output_end_token] = self._resolve_special_token_id(self.tool_output_end_token)
+            tool_outputs_format = "special tokens"
+        else:
+            tool_outputs_format = "plain brackets"
+        print(
+            f"[ApertusSFTDataset] tokenizer {self.tokenizer.name_or_path}: "
+            + ", ".join(f"{token}={token_id}" for token, token_id in resolved.items())
+            + f" | tool outputs rendered with {tool_outputs_format}"
+        )
+
+    def _resolve_special_token_id(self, token: str) -> int:
+        token_id = self.tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or token_id == self.tokenizer.unk_token_id:
+            raise ValueError(f"Special token {token!r} not found in tokenizer {self.tokenizer.name_or_path}")
+        return token_id
 
     def _special_tokens_mask(self, input_ids: np.ndarray) -> np.ndarray:
         return (
-            (input_ids == END_ASSISTANT_TOKEN)
-            | (input_ids == INNER_TOKEN)
-            | (input_ids == OUTER_TOKEN)
-            | (input_ids == TOOL_CALLS_TOKEN)
-            | (input_ids == END_TOOL_CALLS_TOKEN)
+            (input_ids == self.end_assistant_token_id)
+            | (input_ids == self.inner_token_id)
+            | (input_ids == self.outer_token_id)
+            | (input_ids == self.tool_calls_token_id)
+            | (input_ids == self.end_tool_calls_token_id)
         )
 
     def __getitem__(self, item):
@@ -504,11 +544,11 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
         attention_mask_tensor = torch.from_numpy(attention_mask)
 
         if self.only_tools_special_tokens and tools is not None:
-            start_tool_calls = np.cumsum(input_ids == TOOL_CALLS_TOKEN, axis=0) - (
-                input_ids == TOOL_CALLS_TOKEN
+            start_tool_calls = np.cumsum(input_ids == self.tool_calls_token_id, axis=0) - (
+                input_ids == self.tool_calls_token_id
             ).astype(np.int32)
-            end_tool_calls = np.cumsum(input_ids == END_TOOL_CALLS_TOKEN, axis=0) - (
-                input_ids == END_TOOL_CALLS_TOKEN
+            end_tool_calls = np.cumsum(input_ids == self.end_tool_calls_token_id, axis=0) - (
+                input_ids == self.end_tool_calls_token_id
             ).astype(np.int32)
             mask = np.logical_not((start_tool_calls == end_tool_calls)) | self._special_tokens_mask(input_ids)
         else:
@@ -519,15 +559,11 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
                         for block in message["content"]["blocks"]:
                             if block["type"] == "tool_outputs":
                                 tool_outputs = block["outputs"]
-
-                                # TODO: verify this is actually correct: at the moment the tools outputs str 
-                                # is assumed to be enclosed in square brackets but it should actually be enclosed
-                                # by the tool outputs tokens if they exists
-
-
                                 # We format the tool outputs as it is formatted in the chat template
                                 tool_outputs_str = (
-                                    f"[{', '.join([tool_output['output'] for tool_output in tool_outputs])}]"
+                                    self.tool_output_start_token
+                                    + ", ".join(tool_output["output"] for tool_output in tool_outputs)
+                                    + self.tool_output_end_token
                                 )
                                 tool_outputs_lengths.append(
                                     len(tokenizer.encode(tool_outputs_str, add_special_tokens=False))
@@ -535,11 +571,11 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
 
             # We use cumsum to get the different turns
             # Then we subtract to remove the first token of each turn because we don't want to train on it
-            start_assistant = np.cumsum(input_ids == ASSISTANT_TOKEN, axis=0) - (input_ids == ASSISTANT_TOKEN).astype(
-                np.int32
-            )
-            end_assistant = np.cumsum(input_ids == END_ASSISTANT_TOKEN, axis=0) - (
-                input_ids == END_ASSISTANT_TOKEN
+            start_assistant = np.cumsum(input_ids == self.assistant_token_id, axis=0) - (
+                input_ids == self.assistant_token_id
+            ).astype(np.int32)
+            end_assistant = np.cumsum(input_ids == self.end_assistant_token_id, axis=0) - (
+                input_ids == self.end_assistant_token_id
             ).astype(np.int32)
 
             # The mask is 1 if the token is not an assistant token and 0 otherwise
@@ -547,7 +583,7 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
 
             if len(tool_outputs_lengths) > 0:
                 # We are searching the end of the tool calls (or the start of tool outputs) in the assistant tokens
-                end_tool_calls = (start_assistant != end_assistant) & (input_ids == END_TOOL_CALLS_TOKEN)
+                end_tool_calls = (start_assistant != end_assistant) & (input_ids == self.end_tool_calls_token_id)
 
                 start_tool_output_indices = np.arange(stop=input_ids.shape[0])[end_tool_calls] + 1
                 for i, tol in zip(start_tool_output_indices, tool_outputs_lengths):
