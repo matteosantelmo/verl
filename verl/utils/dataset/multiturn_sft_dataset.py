@@ -443,7 +443,7 @@ class MultiTurnSFTDataset(Dataset):
                 "response_mask": response_loss_mask,
             }
 
-
+# TODO: Verify these token IDs match the tokenizer of Apertus 1.5
 SYSTEM_TOKEN = 61
 END_SYSTEM_TOKEN = 62
 DEVELOPER_TOKEN = 63
@@ -519,6 +519,11 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
                         for block in message["content"]["blocks"]:
                             if block["type"] == "tool_outputs":
                                 tool_outputs = block["outputs"]
+
+                                # TODO: verify this is actually correct: at the moment the tools outputs str 
+                                # is assumed to be enclosed in square brackets but it should actually be enclosed
+                                # by the tool outputs tokens if they exists
+
 
                                 # We format the tool outputs as it is formatted in the chat template
                                 tool_outputs_str = (

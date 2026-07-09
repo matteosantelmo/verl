@@ -8,6 +8,8 @@ from __future__ import annotations
 from typing import Any, Callable, Optional, Union, Dict, List
 import os
 import logging
+import re
+from functools import lru_cache
 from json import loads
 from dataclasses import dataclass, field
 
@@ -50,9 +52,6 @@ except ImportError:
     hf_evaluate = None
 
 from .utils import compute_text_ttr, compute_token_ttr
-from .scorer import get_scorer
-
-
 os.environ["HF_ALLOW_CODE_EVAL"] = "1"
 
 
@@ -95,6 +94,19 @@ def extract_answer_from_tool_call(output_text: str) -> str | None:
         return None
 
 
+def extract_answer(output_text: str) -> str | None:
+    """Return a displayed answer when present, otherwise the plain response.
+
+    ``display_answers`` remains supported for old evaluation prompts, but it is
+    not a format requirement. This lets the same verifier score ordinary chat
+    completions and tool-formatted completions.
+    """
+    tool_answer = extract_answer_from_tool_call(output_text)
+    if tool_answer is not None:
+        return tool_answer.strip() or None
+    return output_text.strip() or None
+
+
 def _aggregate_metrics(all_metrics: list[dict[str, float]]) -> dict[str, float]:
     """Aggregate a list of metric dicts by averaging values."""
     aggregated = {}
@@ -132,24 +144,35 @@ def compute_default_metrics(output: dict[str, Any]) -> dict[str, float]:
 
 
 # =============================================================================
-# Math Tasks - Using AutoScoringJudge
+# Math Tasks - Using math_verify
 # =============================================================================
+
+@lru_cache(maxsize=1)
+def _get_math_verify_metric():
+    from math_verify.metric import math_metric
+    from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig
+
+    return math_metric(
+        gold_extraction_target=(LatexExtractionConfig(),),
+        pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),
+    )
+
+
+def _math_verify_score(model_output: str, ground_truth: str) -> float:
+    """Score a mathematical response with Hugging Face math_verify."""
+    gold = ground_truth if "\\boxed" in ground_truth else f"\\boxed{{{ground_truth}}}"
+    score, _ = _get_math_verify_metric()([gold], [model_output])
+    return float(score)
 
 def math_task(output: dict[str, Any] | list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:
     """
-    Mathematical reasoning evaluation using AutoScoringJudge.
+    Mathematical reasoning evaluation using math_verify.
 
     Supports: GSM8K, MATH-500, AMC12, OLYMPIAD_BENCH, MATH_ARENA, OMNI_MATH_*
 
-    The AutoScoringJudge handles:
-    - Exact string match
-    - Numerical equality with tolerance
-    - Mathematical expression equality (LaTeX)
-    - Interval equality
-
     Metrics (organized by benchmark):
         - {task_name}/accuracy: correct answer rate
-        - {task_name}/valid: valid tool call rate
+        - {task_name}/valid: non-empty answer rate
     """
     task_name = params.task_name
 
@@ -162,18 +185,14 @@ def math_task(output: dict[str, Any] | list[dict[str, Any]], params: RolloutPara
             f"{task_name}/valid": 0.0,
         }
 
-        predicted_answer = extract_answer_from_tool_call(output_text)
-        if predicted_answer is None and not params.use_tool:
-            predicted_answer = output_text.strip()
+        predicted_answer = extract_answer(output_text)
 
         if predicted_answer:
             metrics[f"{task_name}/valid"] = 1.0
-            scorer = get_scorer()
             try:
-                if scorer.judge(true_answer, predicted_answer):
-                    metrics[f"{task_name}/accuracy"] = 1.0
-            except Exception:
-                pass
+                metrics[f"{task_name}/accuracy"] = _math_verify_score(predicted_answer, true_answer)
+            except Exception as exc:
+                logger.warning("math_verify failed for %s: %s", task_name, exc)
 
         return metrics
     else:
@@ -194,7 +213,7 @@ def fact_verification_task(output: dict[str, Any] | list[dict[str, Any]], params
 
     Metrics (organized by benchmark):
         - {task_name}/accuracy: correct label rate
-        - {task_name}/valid: valid tool call rate
+        - {task_name}/valid: non-empty answer rate
     """
     task_name = params.task_name
 
@@ -207,9 +226,7 @@ def fact_verification_task(output: dict[str, Any] | list[dict[str, Any]], params
             f"{task_name}/valid": 0.0,
         }
 
-        predicted_answer = extract_answer_from_tool_call(output_text)
-        if predicted_answer is None and not params.use_tool:
-            predicted_answer = output_text.strip()
+        predicted_answer = extract_answer(output_text)
 
         if predicted_answer:
             metrics[f"{task_name}/valid"] = 1.0
@@ -230,6 +247,28 @@ def fact_verification_task(output: dict[str, Any] | list[dict[str, Any]], params
 # Multiple Choice Tasks
 # =============================================================================
 
+_MCQ_ANSWER_PATTERN = re.compile(
+    r"\b(?:FINAL\s+)?ANSWER(?:\s+IS)?\s*[:\-]?\s*([A-Z])\b",
+    flags=re.IGNORECASE,
+)
+
+
+def extract_choice_letter(answer_text: str) -> str | None:
+    """Extract an explicit MCQA choice without treating the first letter as the answer."""
+    text = answer_text.strip().upper()
+
+    explicit_answers = _MCQ_ANSWER_PATTERN.findall(text)
+    if explicit_answers:
+        return explicit_answers[-1]
+
+    final_line = text.rsplit("\n", 1)[-1]
+    bare_answer = re.fullmatch(r"\s*([A-Z])\s*[\).]?\s*", final_line)
+    if bare_answer:
+        return bare_answer.group(1)
+
+    option_start = re.match(r"^\s*([A-Z])\s*[\).:\-]\s+\S", text)
+    return option_start.group(1) if option_start else None
+
 def mcq_task(output: dict[str, Any] | list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:
     """
     Multiple choice question evaluation (GPQA, ACP_BENCH).
@@ -238,7 +277,7 @@ def mcq_task(output: dict[str, Any] | list[dict[str, Any]], params: RolloutParam
 
     Metrics (organized by benchmark):
         - {task_name}/accuracy: correct answer rate
-        - {task_name}/valid: valid tool call rate
+        - {task_name}/valid: extractable answer rate
     """
     task_name = params.task_name
 
@@ -251,21 +290,13 @@ def mcq_task(output: dict[str, Any] | list[dict[str, Any]], params: RolloutParam
             f"{task_name}/valid": 0.0,
         }
 
-        predicted_answer = extract_answer_from_tool_call(output_text)
-        if predicted_answer is None and not params.use_tool:
-            predicted_answer = output_text.strip()
+        answer_text = extract_answer(output_text)
+        predicted_answer = extract_choice_letter(answer_text) if answer_text else None
 
         if predicted_answer:
             metrics[f"{task_name}/valid"] = 1.0
-            predicted_upper = predicted_answer.upper().strip()
-
-            # Check first character for MCQ
-            if len(predicted_upper) > 0:
-                first_char = predicted_upper[0]
-                if first_char in "ABCDE" and first_char == true_answer:
-                    metrics[f"{task_name}/accuracy"] = 1.0
-                elif predicted_upper == true_answer:
-                    metrics[f"{task_name}/accuracy"] = 1.0
+            if predicted_answer == true_answer:
+                metrics[f"{task_name}/accuracy"] = 1.0
 
         return metrics
     else:
@@ -277,18 +308,28 @@ def mcq_task(output: dict[str, Any] | list[dict[str, Any]], params: RolloutParam
 # =============================================================================
 
 if hf_evaluate is not None:
-    CODE_EVAL = hf_evaluate.load("code_eval")
+    try:
+        CODE_EVAL = hf_evaluate.load("code_eval")
+    except Exception as exc:
+        logger.warning("Could not load evaluate/code_eval: %s", exc)
+        CODE_EVAL = None
 else:
     CODE_EVAL = None
 
 
+def _extract_python_code(text: str) -> str:
+    """Extract a Python code fence when present, otherwise return plain code."""
+    if "<|inner_suffix|>" in text:
+        text = text.split("<|inner_suffix|>", 1)[1]
+    elif "<think>" in text:
+        text = text.split("<think>", 1)[1]
+    match = re.search(r"```(?:python)?\s*\n?(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    return (match.group(1) if match else text).strip()
+
+
 def _extract_code_from_thinking(text: str) -> str:
     """Extract code from ```python blocks after skipping the thinking section."""
-    if "<|inner_suffix|>" in text:
-        text = text.split("<|inner_suffix|>")[1]  # skip the thinking part
-    if "```python" not in text:
-        return ""
-    return text.split("```python")[1].split("```")[0].strip()
+    return _extract_python_code(text)
 
 
 def _compute_valid_ratio(output_texts: list[str]) -> float:
@@ -324,6 +365,24 @@ def _build_test_reference(params: RolloutParams) -> str:
     return test
 
 
+def _build_code_candidates(output_texts: list[str], params: RolloutParams) -> list[str]:
+    """Build one executable candidate per sample for pass@k evaluation."""
+    prompt = params.kwargs.get("prompt", "")
+    entry_point = params.kwargs.get("entry_point", "")
+    candidates = []
+    for output_text in output_texts:
+        code = _extract_python_code(output_text)
+        # HumanEval commonly generates only the function body. Do not prepend
+        # the prompt when the response already contains the target definition.
+        if prompt and (not entry_point or f"def {entry_point}" not in code):
+            # HumanEval prompts typically end in indentation spaces; appending
+            # directly preserves those spaces as the generated body's indent.
+            separator = "" if prompt[-1:].isspace() else "\n"
+            code = prompt + separator + code
+        candidates.append(code)
+    return candidates
+
+
 def code_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str, float]:
     """
     Unified code generation evaluation for HumanEval and MBPP benchmarks.
@@ -340,16 +399,10 @@ def code_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str,
     task_name = params.task_name
 
     if CODE_EVAL is None:
-        return {f"{task_name}/pass@10": 0.0}
+        return {f"{task_name}/accuracy": 0.0}
 
     output_texts = [output["text"] for output in outputs]
-    prompt = params.kwargs.get("prompt", "")
-
-    # Build predictions: prepend prompt for HumanEval, use raw output for MBPP
-    if prompt:
-        predictions = [[prompt + ot for ot in output_texts]]
-    else:
-        predictions = [output_texts]
+    candidates = _build_code_candidates(output_texts, params)
 
     test_reference = _build_test_reference(params)
 
@@ -360,7 +413,7 @@ def code_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str,
 
     pass_at_k, _ = CODE_EVAL.compute(
         references=[test_reference],
-        predictions=predictions,
+        predictions=[candidates],
         k=ks,
     )
 
@@ -371,7 +424,7 @@ def code_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[str,
         metrics[f"{task_name}/pass@10"] = float(pass_at_k["pass@10"])
 
     if not metrics:
-        logger.warning(f"No pass@k results found in code evaluation for task {task_name}. Results: {pass_at_k}. Predictions: {predictions} ({n_samples} samples)")
+        logger.warning(f"No pass@k results found in code evaluation for task {task_name}. Results: {pass_at_k}. Predictions: {candidates} ({n_samples} samples)")
         metrics[f"{task_name}/accuracy"] = 0.0
 
     return metrics
@@ -391,12 +444,12 @@ def code_thinking_task(outputs: list[dict[str, Any]], params: RolloutParams) -> 
     task_name = params.task_name
 
     if CODE_EVAL is None:
-        return {f"{task_name}/valid": 0.0, f"{task_name}/pass@10": 0.0}
+        return {f"{task_name}/valid": 0.0, f"{task_name}/accuracy": 0.0}
 
     output_texts = [output["text"] for output in outputs]
 
     valid_ratio = _compute_valid_ratio(output_texts)
-    extracted_code = [_extract_code_from_thinking(ot) for ot in output_texts]
+    extracted_code = _build_code_candidates(output_texts, params)
 
     test_reference = _build_test_reference(params)
 
@@ -531,7 +584,7 @@ def ifbench_task(outputs: list[dict[str, Any]], params: RolloutParams) -> dict[s
 # =============================================================================
 
 TASK_REGISTRY: dict[str, Callable[[Union[dict[str, Any], list[dict[str, Any]]], RolloutParams], dict[str, float]]] = {
-    # Math reasoning (all use math_task with AutoScoringJudge)
+    # Math reasoning (all use math_task with math_verify)
     "math": math_task,
     "gsm8k": math_task,
     "math_500": math_task,
