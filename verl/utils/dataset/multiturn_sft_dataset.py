@@ -449,6 +449,7 @@ class ApertusSFTDataset(MultiTurnSFTDataset):
     INNER_TOKEN = "<|inner_prefix|>"
     OUTER_TOKEN = "<|inner_suffix|>"
     TOOL_CALLS_TOKEN = "<|tools_prefix|>"
+    END_TOOL_CALLS_TOKEN = "<|tools_suffix|>"
     TOOL_OUTPUT_TOKEN_PAIRS = (
         ("<|tool_output_start|>", "<|tool_output_end|>"),   # v1.5
         ("[TOOL_RESULTS]", "[/TOOL_RESULTS]"),  # v1
