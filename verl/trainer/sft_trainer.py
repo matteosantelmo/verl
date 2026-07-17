@@ -77,7 +77,7 @@ class SFTTrainer:
 
         self._build_ckpt_handler()
 
-        self.ckpt_handler.load_checkpoint()
+        self.resume_global_step = self.ckpt_handler.load_checkpoint()
 
         self.device_name = self.config.trainer.device
 
