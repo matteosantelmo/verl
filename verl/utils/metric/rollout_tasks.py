@@ -396,8 +396,8 @@ def _extract_python_code(text: str) -> str:
     """Extract a Python code fence when present, otherwise return plain code."""
     if "<|inner_suffix|>" in text:
         text = text.split("<|inner_suffix|>", 1)[1]
-    elif "<think>" in text:
-        text = text.split("<think>", 1)[1]
+    elif "</think>" in text:
+        text = text.split("</think>", 1)[1]
     match = re.search(r"```(?:python)?\s*\n?(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
     return (match.group(1) if match else text).strip()
 

@@ -238,7 +238,7 @@ class SFTTrainer:
                 master_address=os.environ["MASTER_ADDR"],
                 master_port=int(os.environ["MASTER_PORT"]) + 1,
                 rollout_batch_size=self.config.data.rollout_batch_size,
-                pad_token_id=3,  # TODO: fix this
+                pad_token_id=self.model_config.tokenizer.pad_token_id,
                 sampling_params=dict(getattr(self.config.data, "rollout_sampling_params", {})),
                 max_concurrent_requests=getattr(self.config.data, "rollout_max_concurrent_requests", 1024),
             )
@@ -268,13 +268,17 @@ class SFTTrainer:
                 output = self.engine.infer_batch(data=val_data, loss_function=self.loss_fn)
                 if self.engine.is_mp_src_rank_with_outputs():
                     response_mask = val_data["response_mask"].to(self.device_name).to(bool)
-                    val_losses.append(output["loss"])
+                    # Dynamic batching can split different validation batches into
+                    # different numbers of microbatches. Reduce each batch to one
+                    # scalar before accumulating it; otherwise val_losses becomes
+                    # a ragged list (for example, [[loss], [loss, loss]]).
+                    val_losses.append(torch.stack(output["loss"]).sum())
                     entropy = output["model_output"]["entropy"].to(self.device_name)
                     val_entropies.append(torch.sum(entropy * response_mask) / torch.sum(response_mask))
 
         if self.engine.is_mp_src_rank_with_outputs():
-            val_loss = torch.mean(torch.tensor(val_losses, device=self.device_name))
-            val_entropy = torch.mean(torch.tensor(val_entropies, device=self.device_name))
+            val_loss = torch.stack(val_losses).mean()
+            val_entropy = torch.stack(val_entropies).mean()
 
             torch.distributed.all_reduce(
                 val_loss, op=torch.distributed.ReduceOp.AVG, group=self.engine.get_data_parallel_group()
